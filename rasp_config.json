@@ -1,0 +1,13 @@
+{
+    "raspberry_pis": [
+        {
+            "id": "pi1",
+            "ip": "192.168.1.2",
+            "port": 8000,
+            "camera_index": 0,
+            "exercise": "bicep_curl",
+            "user_name": "dharani"
+        }
+        
+    ]
+}
