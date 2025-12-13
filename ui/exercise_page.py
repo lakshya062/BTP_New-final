@@ -1,4 +1,4 @@
-# core/exercise_page.py
+# ui/exercise_page.py
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QPushButton, QLabel, QHBoxLayout, QGroupBox
@@ -8,7 +8,6 @@ from PySide6.QtCore import Qt, Slot, Signal
 import numpy as np
 from ui.worker import ExerciseWorker
 import os
-
 
 class ExercisePage(QWidget):
     status_message = Signal(str)
@@ -150,7 +149,12 @@ class ExercisePage(QWidget):
 
     @Slot(int, int)
     def emit_counters_update(self, reps, sets):
-        self.counters_update.emit(reps, sets)
+        """
+        This slot receives the rep and set counters from the Worker.
+        It updates the local labels and also emits a signal so that
+        the MainWindow (and hence SmartMirrorWindow) can use them.
+        """
+        self.counters_update.emit(reps, sets)  # <-- forwards to any external connections
         self.rep_label.setText(f"Reps: {reps}")
         self.set_label.setText(f"Sets: {sets}")
 

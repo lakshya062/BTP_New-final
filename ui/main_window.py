@@ -10,6 +10,13 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QFont, QIcon, QGuiApplication, QPixmap, QImage
 from PySide6.QtCore import Qt, QTimer, Slot, QSize
+from screeninfo import get_monitors
+
+import cv2
+import logging
+from datetime import datetime
+from functools import partial
+
 from core.database import DatabaseHandler
 from core.face_recognition import FaceRecognizer
 from ui.exercise_page import ExercisePage
@@ -18,11 +25,6 @@ from ui.member_list_page import MemberListPage
 from ui.cameras_overview_page import CamerasOverviewPage
 from ui.add_exercise_dialog import AddExerciseDialog
 from ui.home_page import HomePage
-import cv2
-import logging
-from datetime import datetime
-from functools import partial
-
 
 def detect_available_cameras(max_cameras=10):
     available_cams = []
@@ -33,12 +35,13 @@ def detect_available_cameras(max_cameras=10):
             cap.release()
     return available_cams
 
-
 class SmartMirrorWindow(QMainWindow):
     """
-    Window for the smart mirror display. Full screen camera(s) view:
-    - All camera feeds are arranged in a grid that covers the entire fullscreen window.
-    - No splitting into halves, no transitions. The entire screen is for the camera feeds.
+    Window for the smart mirror display. It is displayed fullscreen on
+    the second monitor. We will manually center the frame in a black canvas
+    so that it does not stretch. Additionally, we also draw the reps/sets data
+    on the black canvas below the camera feed so that they are not overlapping
+    in the video itself.
     """
     def __init__(self):
         super().__init__()
@@ -47,23 +50,54 @@ class SmartMirrorWindow(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(0,0,0,0)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
 
-        from PySide6.QtWidgets import QGridLayout
-        self.grid_layout = QGridLayout()
-        self.grid_layout.setContentsMargins(0,0,0,0)
-        self.grid_layout.setSpacing(0)
-        self.main_layout.addLayout(self.grid_layout)
-
+        # We store labels for each (camera_index, exercise)
         self.camera_labels = {}
         self.setStyleSheet("background-color: black;")
 
+        # Data structure to store reps/sets for each (cam_idx, exercise)
+        # so we can draw it on the black canvas
+        self.exercise_counters = {}  # ADDED FOR BLACK CANVAS DRAWING
+
+        # Will be configured in set_displays()
+        self.screen_width = 0
+        self.screen_height = 0
+        self.screen_x = 0
+        self.screen_y = 0
+        self.target_width = 1100  # or whatever you like
+        self.target_height = 1500
+        self.x_offset = 0
+        self.y_offset = 0
+
     def set_displays(self, displays):
-        if len(displays) > 1:
-            screen = displays[1]
-            self.move(screen.availableGeometry().topLeft())
-            self.showFullScreen()
+        # If multiple monitors exist, choose the second one
+        monitors = get_monitors()
+        if len(monitors) < 2:
+            logging.warning("Only one monitor detected. Falling back to primary display.")
+            chosen_monitor = monitors[0]
+        else:
+            chosen_monitor = monitors[1]
+
+        # Move this window to chosen_monitor and show fullscreen
+        self.move(chosen_monitor.x, chosen_monitor.y)
+        self.showFullScreen()
+
+        # ADDED / MODIFIED FOR ASPECT RATIO
+        self.screen_width = chosen_monitor.width
+        self.screen_height = chosen_monitor.height
+        self.screen_x = chosen_monitor.x
+        self.screen_y = chosen_monitor.y
+
+        # The size to which we want to scale the camera feed
+        self.target_width = 1000
+        self.target_height = 1500
+
+        # Offsets to place the feed
+        self.x_offset = (self.screen_width - self.target_width) // 2
+        # Example offset from your aspect.py
+        self.y_offset = 50
 
     def add_camera_display(self, camera_index, exercise):
         key = (camera_index, exercise)
@@ -72,65 +106,136 @@ class SmartMirrorWindow(QMainWindow):
             label.setAlignment(Qt.AlignCenter)
             label.setStyleSheet("background-color: black;")
             label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            label.setScaledContents(True)  # Allow image to expand to fill the label
-
             self.camera_labels[key] = label
-            self.relayout_thumbnails()
+            self.main_layout.addWidget(label)
 
     def remove_camera_display(self, camera_index, exercise):
         key = (camera_index, exercise)
         if key in self.camera_labels:
             lbl = self.camera_labels[key]
-            self.grid_layout.removeWidget(lbl)
+            self.main_layout.removeWidget(lbl)
             lbl.deleteLater()
             del self.camera_labels[key]
-            self.relayout_thumbnails()
 
-    def relayout_thumbnails(self):
-        # Clear layout
-        while self.grid_layout.count():
-            item = self.grid_layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
-
-        items = list(self.camera_labels.items())
-        count = len(items)
-        if count == 0:
-            return
-
-        rows, cols = self.compute_rows_cols(count)
-
-        for idx, ((ci, ex), lbl) in enumerate(items):
-            row = idx // cols
-            col = idx % cols
-            self.grid_layout.addWidget(lbl, row, col)
-
-        for i in range(rows):
-            self.grid_layout.setRowStretch(i, 1)
-        for j in range(cols):
-            self.grid_layout.setColumnStretch(j, 1)
-
-    def compute_rows_cols(self, count):
-        import math
-        rows = int(math.ceil(math.sqrt(count)))
-        cols = int(math.ceil(count / rows))
-        return rows, cols
+    def update_counters_for_exercise(self, camera_index, exercise, reps, sets):
+        """
+        Called from the main window (or ExercisePage) whenever the counters are updated.
+        We store them here so we can draw them in update_thumbnail() on the black canvas.
+        """
+        self.exercise_counters[(camera_index, exercise)] = (reps, sets)
 
     def update_thumbnail(self, camera_index, exercise, frame):
+        """
+        Called repeatedly by the worker to show new frames.
+        We'll replicate the black-canvas approach and also draw
+        rep/set counters below the feed (so they don't overlap).
+        """
         key = (camera_index, exercise)
         if key not in self.camera_labels:
-            return
+            return  # Not displayed?
+
         label = self.camera_labels[key]
-        try:
-            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb_image.shape
-            bytes_per_line = ch * w
-            qimg = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            pix = QPixmap.fromImage(qimg)
-            # Just set the pixmap; scaling will be handled by label.setScaledContents(True)
-            label.setPixmap(pix)
-        except Exception as e:
-            logging.error(f"Error updating smart mirror thumbnail for cam_{camera_index}: {e}")
+
+        # 1. Create a black canvas matching the entire second monitor resolution
+        import numpy as np
+        canvas = np.zeros((self.screen_height, self.screen_width, 3), dtype=np.uint8)
+
+        # 2. Resize the actual camera frame to (target_width x target_height)
+        resized_frame = cv2.resize(frame, (self.target_width, self.target_height))
+
+        # 3. Paste the resized feed into the black canvas at (x_offset, y_offset)
+        y1 = self.y_offset
+        y2 = y1 + self.target_height
+        x1 = self.x_offset
+        x2 = x1 + self.target_width
+        # Make sure we don't go out of range
+        if y2 > self.screen_height:
+            y2 = self.screen_height
+        if x2 > self.screen_width:
+            x2 = self.screen_width
+
+        # canvas[y1:y2, x1:x2] = resized_frame[0:(y2 - y1), 0:(x2 - x1)]
+
+        sub_resized = resized_frame[0:(y2 - y1), 0:(x2 - x1)]
+
+        # --- ADDED FOR OPACITY REDUCTION ---
+        alpha = 0.9  # 0.5 means 50% opacity of the camera feed
+        blend = cv2.addWeighted(
+            canvas[y1:y2, x1:x2], (1 - alpha),  # background portion
+            sub_resized, alpha,                # camera feed portion
+            0
+        )
+        canvas[y1:y2, x1:x2] = blend
+
+        # ---------- ADDED FOR BLACK CANVAS DRAWING ----------
+        # We'll also draw text (reps/sets) and progress bars on the black canvas
+        # below the camera feed, so that it does NOT overlap the feed.
+
+        # retrieve counters from dictionary
+        reps, sets_done = self.exercise_counters.get((camera_index, exercise), (0, 0))
+
+        # Hardcoded or config-based max reps/sets for progress bar illustration
+        # (You can also pass real "max_reps / max_sets" in a similar manner.)
+        max_reps = 12
+        max_sets = 5
+
+        # define a font
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 1.2
+        color = (255, 255, 255)
+        thickness = 3
+
+        # define the region below the feed to draw text
+        # let's place it ~40px below the bottom of the feed
+        text_start_y = y2 + 40
+        text_x = x1
+
+        # 1) Draw the line "Exercise: ...."
+        exercise_text = f"Exercise: {exercise.replace('_',' ').title()}"
+        cv2.putText(canvas, exercise_text, (text_x, text_start_y), font, font_scale, color, thickness, cv2.LINE_AA)
+
+        # 2) Next line for reps, sets
+        line_gap = 60
+        rep_set_text = f"Reps: {reps} / {max_reps}    |    Sets: {sets_done} / {max_sets}"
+        cv2.putText(canvas, rep_set_text, (text_x, text_start_y + line_gap), font, font_scale, color, thickness, cv2.LINE_AA)
+
+        # 3) Progress bars for reps and sets
+        #    We'll place them further down
+        bar_gap = 50
+        bar_height = 25
+        # Rep progress bar
+        rep_bar_y = text_start_y + line_gap + bar_gap
+        rep_bar_width = 400
+        # draw border
+        cv2.rectangle(canvas, (text_x, rep_bar_y), (text_x + rep_bar_width, rep_bar_y + bar_height), (255, 255, 255), 2)
+        # fill fraction
+        fraction_reps = min(max(reps, 0), max_reps) / float(max_reps)
+        fill_w = int(fraction_reps * (rep_bar_width - 4))  # -4 for border thickness
+        cv2.rectangle(canvas, (text_x + 2, rep_bar_y + 2), (text_x + 2 + fill_w, rep_bar_y + bar_height - 2), (0, 255, 0), -1)
+        cv2.putText(canvas, "Reps Progress", (text_x + rep_bar_width + 20, rep_bar_y + bar_height - 5),
+                    font, 0.7, (200, 200, 200), 2)
+
+        # Sets progress bar
+        sets_bar_y = rep_bar_y + bar_gap + bar_height
+        sets_bar_width = 400
+        # draw border
+        cv2.rectangle(canvas, (text_x, sets_bar_y), (text_x + sets_bar_width, sets_bar_y + bar_height), (255, 255, 255), 2)
+        fraction_sets = min(max(sets_done, 0), max_sets) / float(max_sets)
+        fill_w_sets = int(fraction_sets * (sets_bar_width - 4))
+        cv2.rectangle(canvas, (text_x + 2, sets_bar_y + 2), (text_x + 2 + fill_w_sets, sets_bar_y + bar_height - 2), (0, 255, 0), -1)
+        cv2.putText(canvas, "Sets Progress", (text_x + sets_bar_width + 20, sets_bar_y + bar_height - 5),
+                    font, 0.7, (200, 200, 200), 2)
+        # ---------- END: ADDED FOR BLACK CANVAS DRAWING ----------
+
+        # 4. Convert canvas to QImage
+        rgb_image = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qimg = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qimg)
+
+        # 5. Show the final result
+        label.setPixmap(pix)
 
 
 class MainWindow(QMainWindow):
@@ -302,16 +407,12 @@ class MainWindow(QMainWindow):
             self.global_face_recognizer
         )
         exercise_page.status_message.connect(self.update_status)
-        exercise_page.counters_update.connect(self.update_counters)
+        exercise_page.counters_update.connect(
+            partial(self.handle_counters_for_exercise, camera_index, exercise)
+        )  # <-- ADDED FOR BLACK CANVAS DRAWING
         exercise_page.user_recognized_signal.connect(self.handle_user_recognized)
         exercise_page.unknown_user_detected.connect(self.prompt_new_user_name)
         exercise_page.worker_started.connect(lambda: self.connect_data_updated_signal(exercise_page))
-
-        if self.smart_mirror_window:
-            self.smart_mirror_window.add_camera_display(camera_index, exercise)
-            exercise_page.worker.frame_signal.connect(
-                partial(self.smart_mirror_window.update_thumbnail, camera_index, exercise)
-            )
 
         tab_label = f"{exercise.replace('_', ' ').title()} (cam_{camera_index})"
         self.tabs.addTab(exercise_page, QIcon(os.path.join("resources", "icons", "exercise.png")), tab_label)
@@ -319,19 +420,38 @@ class MainWindow(QMainWindow):
 
         if start_immediately:
             exercise_page.start_exercise()
+            # If we haven't opened the smart mirror window yet, do so now
             if self.smart_mirror_window is None:
                 screens = QGuiApplication.screens()
                 if len(screens) > 1:
                     self.smart_mirror_window = SmartMirrorWindow()
                     self.smart_mirror_window.set_displays(screens)
                     self.smart_mirror_window.add_camera_display(camera_index, exercise)
+                    # connect the frame signal from worker to the mirror's update_thumbnail
                     exercise_page.worker.frame_signal.connect(
                         partial(self.smart_mirror_window.update_thumbnail, camera_index, exercise)
                     )
+            else:
+                # If it already exists, just add the camera label
+                self.smart_mirror_window.add_camera_display(camera_index, exercise)
+                exercise_page.worker.frame_signal.connect(
+                    partial(self.smart_mirror_window.update_thumbnail, camera_index, exercise)
+                )
+
             if self.smart_mirror_window and not self.smart_mirror_window.isVisible():
                 self.smart_mirror_window.show()
 
         self.update_overview_tab()
+
+    @Slot(int, int, int, int)
+    def handle_counters_for_exercise(self, camera_index, exercise, reps, sets_):
+        """
+        We receive reps and sets from the ExercisePage.
+        Forward them to the SmartMirrorWindow so it can draw
+        them on the black canvas if that feed is visible.
+        """
+        if self.smart_mirror_window:
+            self.smart_mirror_window.update_counters_for_exercise(camera_index, exercise, reps, sets_)
 
     @Slot()
     def connect_data_updated_signal(self, exercise_page):
@@ -450,6 +570,14 @@ class MainWindow(QMainWindow):
                             p.worker.frame_signal.connect(
                                 partial(self.smart_mirror_window.update_thumbnail, ci, exx)
                             )
+            else:
+                for (p, ci, exx, _) in self.exercise_pages:
+                    if p.is_exercise_running():
+                        self.smart_mirror_window.add_camera_display(ci, exx)
+                        p.worker.frame_signal.connect(
+                            partial(self.smart_mirror_window.update_thumbnail, ci, exx)
+                        )
+
             if self.smart_mirror_window and not self.smart_mirror_window.isVisible():
                 self.smart_mirror_window.show()
 
@@ -484,6 +612,7 @@ class MainWindow(QMainWindow):
         pass
 
     def sync_local_data_to_sqlite(self):
+        # If you have logic to sync data or do housekeeping, do it here
         pass
 
     def closeEvent(self, event):
