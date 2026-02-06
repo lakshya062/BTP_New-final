@@ -19,9 +19,16 @@ ARUCO_DICT = {
     "DICT_4X4_50": cv2.aruco.DICT_4X4_50,
     "DICT_5X5_100": cv2.aruco.DICT_5X5_100,
 }
+if hasattr(cv2.aruco, "ArucoDetector"):
+    arucoDict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT["DICT_5X5_100"])
+    arucoParams = cv2.aruco.DetectorParameters()
+    arucoDetector = cv2.aruco.ArucoDetector(arucoDict, arucoParams)
+    USE_NEW_ARUCO = True
+else:
+    arucoDict = cv2.aruco.Dictionary_get(ARUCO_DICT["DICT_5X5_100"])
+    arucoParams = cv2.aruco.DetectorParameters_create()
+    USE_NEW_ARUCO = False
 
-arucoDict = cv2.aruco.Dictionary_get(ARUCO_DICT["DICT_5X5_100"])
-arucoParams = cv2.aruco.DetectorParameters_create()
 
 
 class ExerciseAnalyzer:
@@ -118,7 +125,13 @@ class ExerciseAnalyzer:
                 angle = 0
 
             # Detect ArUco markers for weight detection
-            corners, ids, rejected = cv2.aruco.detectMarkers(frame, arucoDict, parameters=arucoParams)
+            if USE_NEW_ARUCO:
+                corners, ids, rejected = arucoDetector.detectMarkers(frame)
+            else:
+                corners, ids, rejected = cv2.aruco.detectMarkers(
+                    frame, arucoDict, parameters=arucoParams
+                )
+
             if ids is not None:
                 try:
                     self.current_weight = int(ids[0][0])

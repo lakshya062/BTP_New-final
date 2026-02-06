@@ -391,3 +391,5 @@ class ExerciseWorker(QThread):
             self.status_signal.emit("Error during cleanup.")
             logging.error(f"Error during cleanup: {e}")
         # No signal disconnect calls here
+
+#You are a great coder
