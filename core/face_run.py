@@ -5,11 +5,15 @@ import face_recognition
 import os
 import numpy as np
 import h5py
-from multiprocessing import Pool, cpu_count
 import logging
 import threading
 
 logger = logging.getLogger(__name__)
+
+FRAME_SCALE = 0.25
+MATCH_TOLERANCE = 0.45
+MIN_MATCH_MARGIN = 0.03
+MAX_ENCODINGS_PER_USER = 80
 
 
 def load_trained_model_hdf5(model_path="trained_model.hdf5"):
@@ -22,38 +26,125 @@ def load_trained_model_hdf5(model_path="trained_model.hdf5"):
     try:
         with h5py.File(model_path, 'r') as f:
             for person_name in f.keys():
-                encodings = f[f"{person_name}/encodings"][:]
+                encodings = np.asarray(f[f"{person_name}/encodings"][:], dtype=np.float32)
                 names = f[f"{person_name}/names"][:]
+                if encodings.ndim == 1:
+                    encodings = encodings.reshape(1, -1)
+                if len(encodings) == 0:
+                    continue
+                if len(encodings) > MAX_ENCODINGS_PER_USER:
+                    sample_idx = np.linspace(
+                        0,
+                        len(encodings) - 1,
+                        num=MAX_ENCODINGS_PER_USER,
+                        dtype=np.int32,
+                    )
+                    encodings = encodings[sample_idx]
+                    names = names[sample_idx]
                 known_face_encodings.extend(encodings)
-                known_face_names.extend([name.decode('utf-8') for name in names])
+                known_face_names.extend([
+                    name.decode('utf-8') if isinstance(name, (bytes, bytearray)) else str(name)
+                    for name in names
+                ])
         logger.info("Loaded %s face encodings from %s.", len(known_face_encodings), model_path)
     except Exception as e:
         logger.error("Error loading trained model from %s: %s", model_path, e)
     return known_face_encodings, known_face_names
 
 
+def _build_name_to_indices(known_face_names):
+    name_to_indices = {}
+    for idx, name in enumerate(known_face_names):
+        name_to_indices.setdefault(name, []).append(idx)
+    return {
+        name: np.asarray(indices, dtype=np.int32)
+        for name, indices in name_to_indices.items()
+    }
+
+
+def _resolve_identity(distances, name_to_indices, tolerance, min_margin):
+    best_name = "Unknown"
+    best_score = float("inf")
+    second_score = float("inf")
+
+    for name, indices in name_to_indices.items():
+        user_distances = distances[indices]
+        if user_distances.size == 0:
+            continue
+        user_min = float(np.min(user_distances))
+        user_p25 = float(np.percentile(user_distances, 25))
+        # Blend closest match with a robust user-level percentile to reduce identity flicker.
+        user_score = (0.72 * user_min) + (0.28 * user_p25)
+        if user_score < best_score:
+            second_score = best_score
+            best_score = user_score
+            best_name = name
+        elif user_score < second_score:
+            second_score = user_score
+
+    if best_name == "Unknown":
+        return "Unknown"
+    if best_score > tolerance:
+        return "Unknown"
+    if not np.isinf(second_score) and (second_score - best_score) < min_margin:
+        return "Unknown"
+    return best_name
+
+
 def process_frame(args):
     """Process a single video frame for face recognition."""
-    frame, known_face_encodings, known_face_names = args
+    if len(args) < 3:
+        raise ValueError("process_frame expects at least (frame, encodings, names).")
+
+    frame, known_face_encodings, known_face_names = args[:3]
+    name_to_indices = None
+    inference_config = {}
+    if len(args) >= 5:
+        name_to_indices = args[3]
+        inference_config = args[4] if isinstance(args[4], dict) else {}
+    elif len(args) == 4 and isinstance(args[3], dict):
+        inference_config = args[3]
+
+    frame_scale = float(inference_config.get("frame_scale", FRAME_SCALE))
+    if frame_scale <= 0 or frame_scale > 1:
+        frame_scale = FRAME_SCALE
+    tolerance = float(inference_config.get("tolerance", MATCH_TOLERANCE))
+    min_margin = float(inference_config.get("min_margin", MIN_MATCH_MARGIN))
+    face_location_model = inference_config.get("face_location_model", "hog")
+    face_upsample = int(inference_config.get("face_upsample", 0))
+
     try:
-        # Resize frame for faster processing
-        frame_small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-        face_locations = face_recognition.face_locations(frame_small)
-        face_encodings = face_recognition.face_encodings(frame_small, face_locations)
+        known_face_encodings_np = np.asarray(known_face_encodings, dtype=np.float32)
+        if known_face_encodings_np.ndim == 1 and known_face_encodings_np.size:
+            known_face_encodings_np = known_face_encodings_np.reshape(1, -1)
+        if known_face_encodings_np.ndim != 2:
+            known_face_encodings_np = np.empty((0, 128), dtype=np.float32)
+        if name_to_indices is None:
+            name_to_indices = _build_name_to_indices(known_face_names)
+
+        if frame_scale == 1.0:
+            frame_small = frame
+        else:
+            frame_small = cv2.resize(frame, (0, 0), fx=frame_scale, fy=frame_scale)
+
+        # face_recognition expects RGB frames; passing BGR increases misclassification/flicker.
+        rgb_small_frame = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(
+            rgb_small_frame,
+            number_of_times_to_upsample=face_upsample,
+            model=face_location_model,
+        )
+        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+
         face_names = []
-        tolerance = 0.4  # Stricter tolerance
         for face_encoding in face_encodings:
-            # Compute distances
-            distances = face_recognition.face_distance(known_face_encodings, face_encoding)
-            if len(distances) > 0:
-                best_match_index = np.argmin(distances)
-                if distances[best_match_index] < tolerance:
-                    name = known_face_names[best_match_index]
-                else:
-                    name = "Unknown"
-            else:
+            if known_face_encodings_np.size == 0 or not name_to_indices:
                 name = "Unknown"
+            else:
+                distances = face_recognition.face_distance(known_face_encodings_np, face_encoding)
+                name = _resolve_identity(distances, name_to_indices, tolerance, min_margin)
             face_names.append(name)
+
         return frame, face_locations, face_names
     except Exception as e:
         logger.error("Error processing frame: %s", e)
@@ -121,48 +212,65 @@ class FaceRecognizer:
     def __init__(self, model_path="trained_model.hdf5"):
         self.model_path = model_path
         self._lock = threading.RLock()
-        self.pool = None
         self.known_face_encodings = []
         self.known_face_names = []
+        self._known_face_encodings_np = np.empty((0, 128), dtype=np.float32)
+        self._name_to_indices = {}
+        self._inference_config = {
+            "frame_scale": FRAME_SCALE,
+            "tolerance": MATCH_TOLERANCE,
+            "min_margin": MIN_MATCH_MARGIN,
+            "face_location_model": "hog",
+            "face_upsample": 0,
+        }
         self._load_model()
 
     def _load_model(self):
-        """Load the trained model and initialize the multiprocessing pool."""
+        """Load the trained model and build fast lookup structures."""
         try:
             self.known_face_encodings, self.known_face_names = load_trained_model_hdf5(self.model_path)
             if not self.known_face_encodings:
                 logger.warning("No face encodings found in the model.")
-            workers = max(1, (cpu_count() or 1))
-            self.pool = Pool(processes=workers)
-            logger.info("Initialized multiprocessing pool with %s processes.", workers)
+            self._known_face_encodings_np = np.asarray(self.known_face_encodings, dtype=np.float32)
+            if self._known_face_encodings_np.ndim == 1 and self._known_face_encodings_np.size:
+                self._known_face_encodings_np = self._known_face_encodings_np.reshape(1, -1)
+            if self._known_face_encodings_np.ndim != 2:
+                self._known_face_encodings_np = np.empty((0, 128), dtype=np.float32)
+            self._name_to_indices = _build_name_to_indices(self.known_face_names)
+            logger.info(
+                "Face model ready: %s users, %s encodings.",
+                len(set(self.known_face_names)),
+                len(self.known_face_names),
+            )
         except Exception as e:
             logger.error("Failed to initialize FaceRecognizer: %s", e)
             self.known_face_encodings = []
             self.known_face_names = []
-            self.pool = None
+            self._known_face_encodings_np = np.empty((0, 128), dtype=np.float32)
+            self._name_to_indices = {}
 
     def reload_model(self):
-        """Reload the trained model and restart the multiprocessing pool."""
+        """Reload the trained model."""
         with self._lock:
-            if self.pool:
-                self.pool.close()
-                self.pool.join()
-                logger.info("Closed existing multiprocessing pool.")
-                self.pool = None
             self._load_model()
 
     def recognize_faces(self, frame):
-        """Recognize faces in the given frame using multiprocessing."""
+        """Recognize faces in the given frame."""
         with self._lock:
-            if not self.pool:
-                logger.error("Multiprocessing pool not initialized.")
-                return frame, [], []
-            known_face_encodings = list(self.known_face_encodings)
-            known_face_names = list(self.known_face_names)
-            pool = self.pool
+            known_face_encodings_np = self._known_face_encodings_np
+            known_face_names = tuple(self.known_face_names)
+            name_to_indices = self._name_to_indices
+            inference_config = dict(self._inference_config)
         try:
-            result = pool.apply_async(process_frame, args=((frame, known_face_encodings, known_face_names),))
-            _, face_locations, face_names = result.get(timeout=5)
+            _, face_locations, face_names = process_frame(
+                (
+                    frame,
+                    known_face_encodings_np,
+                    known_face_names,
+                    name_to_indices,
+                    inference_config,
+                )
+            )
             return frame, face_locations, face_names
         except Exception as e:
             logger.error("Error in recognize_faces: %s", e)
@@ -186,14 +294,5 @@ class FaceRecognizer:
             return success
 
     def close(self):
-        """Close the multiprocessing pool."""
-        with self._lock:
-            if self.pool:
-                try:
-                    self.pool.close()
-                    self.pool.join()
-                    logger.info("Multiprocessing pool closed successfully.")
-                except Exception as e:
-                    logger.error("Error closing pool: %s", e)
-                finally:
-                    self.pool = None
+        """Close resources held by face recognizer."""
+        logger.info("FaceRecognizer closed.")

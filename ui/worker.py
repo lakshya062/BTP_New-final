@@ -75,11 +75,15 @@ class ExerciseWorker(QThread):
         self.unknown_frames = 0
         self.UNKNOWN_FRAME_THRESHOLD = 15
         self.KNOWN_FRAME_THRESHOLD = 30
+        self.KNOWN_FRAME_DECAY = 1
+        self.UNKNOWN_FRAME_DECAY = 1
+        self.KNOWN_FRAME_SWITCH_PENALTY = 12
 
         self.new_user_name = None
         self.new_user_encodings = []
         self.capturing_new_user_data = False
-        self.frames_to_capture = 200
+        self.frames_to_capture = 120
+        self.MIN_REGISTRATION_FACE_AREA = 36 * 36
 
         self.face_recognition_active = True
         self.exercise_analysis_active = False
@@ -89,6 +93,15 @@ class ExerciseWorker(QThread):
         self.known_frames = 0
         self.last_recognized_user = None
         self.unknown_stable_detected = False
+
+        self.STABLE_LABEL_BUILDUP = 3
+        self.STABLE_LABEL_DECAY = 1
+        self.STABLE_LABEL_MIN_SCORE = 6
+        self.STABLE_LABEL_SWITCH_MARGIN = 4
+        self.STABLE_LABEL_FORGET_FRAMES = 20
+        self._label_scores = {}
+        self._stable_primary_label = None
+        self._frames_without_primary_face = 0
 
         self.assigned_user_name = (assigned_user_name or "Athlete").strip() or "Athlete"
         self.display_user_name = self.assigned_user_name
@@ -103,8 +116,73 @@ class ExerciseWorker(QThread):
         self.new_user_name = user_name
         self.new_user_encodings = []
         self.capturing_new_user_data = True
+        self._reset_face_recognition_state()
         self.status_signal.emit(f"Capturing face data for {user_name}. Please wait...")
         logging.info(f"Started capturing face data for new user: {user_name}")
+
+    def _reset_face_recognition_state(self):
+        self.unknown_frames = 0
+        self.known_frames = 0
+        self.last_recognized_user = None
+        self.unknown_stable_detected = False
+        self._label_scores = {}
+        self._stable_primary_label = None
+        self._frames_without_primary_face = 0
+
+    def _select_primary_face_index(self, face_locations):
+        if not face_locations:
+            return None
+        return max(
+            range(len(face_locations)),
+            key=lambda idx: max(0, face_locations[idx][2] - face_locations[idx][0])
+            * max(0, face_locations[idx][1] - face_locations[idx][3]),
+        )
+
+    def _update_stable_primary_label(self, observed_label):
+        if observed_label is None:
+            self._frames_without_primary_face += 1
+            for label in list(self._label_scores.keys()):
+                updated_score = self._label_scores[label] - self.STABLE_LABEL_DECAY
+                if updated_score <= 0:
+                    del self._label_scores[label]
+                else:
+                    self._label_scores[label] = updated_score
+            if self._frames_without_primary_face >= self.STABLE_LABEL_FORGET_FRAMES:
+                self._stable_primary_label = None
+            return self._stable_primary_label
+
+        self._frames_without_primary_face = 0
+        for label in list(self._label_scores.keys()):
+            if label == observed_label:
+                self._label_scores[label] = min(
+                    100,
+                    self._label_scores[label] + self.STABLE_LABEL_BUILDUP,
+                )
+            else:
+                updated_score = self._label_scores[label] - self.STABLE_LABEL_DECAY
+                if updated_score <= 0:
+                    del self._label_scores[label]
+                else:
+                    self._label_scores[label] = updated_score
+
+        if observed_label not in self._label_scores:
+            self._label_scores[observed_label] = self.STABLE_LABEL_BUILDUP
+
+        top_label, top_score = max(self._label_scores.items(), key=lambda item: item[1])
+        if self._stable_primary_label is None:
+            if top_score >= self.STABLE_LABEL_MIN_SCORE:
+                self._stable_primary_label = top_label
+        elif top_label != self._stable_primary_label:
+            stable_score = self._label_scores.get(self._stable_primary_label, 0)
+            if (
+                top_score >= self.STABLE_LABEL_MIN_SCORE
+                and top_score >= stable_score + self.STABLE_LABEL_SWITCH_MARGIN
+            ):
+                self._stable_primary_label = top_label
+
+        if self._stable_primary_label is not None:
+            return self._stable_primary_label
+        return top_label
 
     def _emit_important_audio(self, feedback_texts):
         critical_feedback = [
@@ -548,6 +626,7 @@ class ExerciseWorker(QThread):
                                 self.exercise_analyzer = None
                                 self.exercise_analysis_active = False
                                 self.face_recognition_active = True
+                                self._reset_face_recognition_state()
                                 self.status_signal.emit("Returning to Face Recognition Mode.")
                                 logging.info("Switched back to Face Recognition Mode.")
 
@@ -566,12 +645,30 @@ class ExerciseWorker(QThread):
                         small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
                         rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-                        face_locations = fr_lib.face_locations(rgb_small_frame)
+                        face_locations = fr_lib.face_locations(
+                            rgb_small_frame,
+                            number_of_times_to_upsample=0,
+                            model="hog",
+                        )
                         encodings = fr_lib.face_encodings(rgb_small_frame, face_locations)
-                        self.new_user_encodings.extend(encodings)
+                        capture_feedback = "Hold still and look straight at the camera."
+                        if len(face_locations) == 1 and len(encodings) == 1:
+                            top, right, bottom, left = face_locations[0]
+                            face_area = max(0, bottom - top) * max(0, right - left)
+                            if face_area >= self.MIN_REGISTRATION_FACE_AREA:
+                                self.new_user_encodings.append(encodings[0])
+                            else:
+                                capture_feedback = "Move closer so your face appears larger."
+                        elif len(face_locations) > 1:
+                            capture_feedback = "Multiple faces detected. Keep only one face in frame."
+                        else:
+                            capture_feedback = "No face detected. Center your face in frame."
 
                         progress = len(self.new_user_encodings)
-                        hint = f"Registering {self.new_user_name}: {progress}/{self.frames_to_capture}"
+                        hint = (
+                            f"Registering {self.new_user_name}: "
+                            f"{progress}/{self.frames_to_capture} | {capture_feedback}"
+                        )
                         overlay_data = self._build_overlay_data(
                             metrics={"rep_count": 0, "set_count": 0, "current_weight": 0},
                             feedback_texts=[],
@@ -616,10 +713,7 @@ class ExerciseWorker(QThread):
                             self.new_user_encodings = []
                             self.capturing_new_user_data = False
                             self.face_recognition_active = True
-                            self.unknown_stable_detected = False
-                            self.unknown_frames = 0
-                            self.known_frames = 0
-                            self.last_recognized_user = None
+                            self._reset_face_recognition_state()
 
                         self.msleep(10)
                         continue
@@ -634,8 +728,22 @@ class ExerciseWorker(QThread):
                     try:
                         _, face_locations, face_names = self.face_recognizer.recognize_faces(frame)
                         status_hint = "Stand in front of the camera for recognition."
+                        primary_face_index = self._select_primary_face_index(face_locations)
+                        primary_raw_label = (
+                            face_names[primary_face_index]
+                            if primary_face_index is not None and primary_face_index < len(face_names)
+                            else None
+                        )
+                        stable_primary_label = self._update_stable_primary_label(primary_raw_label)
+                        display_face_names = list(face_names)
+                        if (
+                            primary_face_index is not None
+                            and stable_primary_label is not None
+                            and primary_face_index < len(display_face_names)
+                        ):
+                            display_face_names[primary_face_index] = stable_primary_label
 
-                        for ((top, right, bottom, left), name) in zip(face_locations, face_names):
+                        for ((top, right, bottom, left), name) in zip(face_locations, display_face_names):
                             top *= 4
                             right *= 4
                             bottom *= 4
@@ -665,10 +773,16 @@ class ExerciseWorker(QThread):
                                 cv2.LINE_AA,
                             )
 
-                        if len(face_names) > 0:
-                            if all(n == "Unknown" for n in face_names):
-                                self.unknown_frames += 1
-                                self.known_frames = 0
+                        if primary_face_index is not None and primary_face_index < len(display_face_names):
+                            effective_label = display_face_names[primary_face_index]
+                            if effective_label == "Unknown":
+                                self.unknown_frames = min(
+                                    self.UNKNOWN_FRAME_THRESHOLD,
+                                    self.unknown_frames + 1,
+                                )
+                                self.known_frames = max(0, self.known_frames - self.KNOWN_FRAME_DECAY)
+                                if self.known_frames == 0:
+                                    self.last_recognized_user = None
                                 status_hint = "Unknown user detected. Hold still for registration."
                                 if (
                                     self.unknown_frames >= self.UNKNOWN_FRAME_THRESHOLD
@@ -681,16 +795,29 @@ class ExerciseWorker(QThread):
                                     self.unknown_user_detected.emit()
                                     self.unknown_stable_detected = True
                             else:
-                                self.unknown_frames = 0
-                                self.unknown_stable_detected = False
-                                recognized_user = [n for n in face_names if n != "Unknown"][0]
+                                recognized_user = effective_label
+                                self.unknown_frames = max(
+                                    0,
+                                    self.unknown_frames - self.UNKNOWN_FRAME_DECAY,
+                                )
+                                if self.unknown_frames == 0:
+                                    self.unknown_stable_detected = False
                                 self.display_user_name = recognized_user
                                 status_hint = "User recognized. Preparing real-time feedback."
-                                if recognized_user == self.last_recognized_user:
-                                    self.known_frames += 1
+                                if self.last_recognized_user is None:
+                                    self.last_recognized_user = recognized_user
+                                    self.known_frames = max(1, self.known_frames)
+                                elif recognized_user == self.last_recognized_user:
+                                    self.known_frames = min(
+                                        self.KNOWN_FRAME_THRESHOLD,
+                                        self.known_frames + 1,
+                                    )
                                 else:
                                     self.last_recognized_user = recognized_user
-                                    self.known_frames = 1
+                                    self.known_frames = max(
+                                        1,
+                                        self.known_frames - self.KNOWN_FRAME_SWITCH_PENALTY,
+                                    )
 
                                 if self.known_frames >= self.KNOWN_FRAME_THRESHOLD:
                                     logging.info(f"User recognized: {recognized_user}")
@@ -713,6 +840,7 @@ class ExerciseWorker(QThread):
                                         )
                                         self.exercise_analysis_active = True
                                         self.face_recognition_active = False
+                                        self._reset_face_recognition_state()
                                     else:
                                         self.status_signal.emit(
                                             f"Face recognized as {recognized_user}, but no member info found."
@@ -722,10 +850,12 @@ class ExerciseWorker(QThread):
                                             recognized_user,
                                         )
                         else:
-                            self.unknown_frames = 0
-                            self.known_frames = 0
-                            self.last_recognized_user = None
-                            self.unknown_stable_detected = False
+                            self.unknown_frames = max(0, self.unknown_frames - self.UNKNOWN_FRAME_DECAY)
+                            self.known_frames = max(0, self.known_frames - self.KNOWN_FRAME_DECAY)
+                            if self.known_frames == 0:
+                                self.last_recognized_user = None
+                            if self.unknown_frames == 0:
+                                self.unknown_stable_detected = False
 
                         overlay_data = self._build_overlay_data(
                             metrics={"rep_count": 0, "set_count": 0, "current_weight": 0},
