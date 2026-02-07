@@ -1,0 +1,32 @@
+gymstartup/
+
+# Python cache and virtualenvs
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+env/
+
+# Editor/system files
+.DS_Store
+.vscode/
+
+# Local runtime artifacts
+*.log
+worker.log
+database.log
+network_utils.log
+local_members.db
+*.sqlite
+*.sqlite3
+
+# Model/runtime-generated artifacts
+checkpoints/
+*.hdf5
+
+# Build/test artifacts
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
