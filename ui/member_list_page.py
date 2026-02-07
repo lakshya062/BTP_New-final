@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from ui.user_exercise_data_page import UserExerciseDataPage
 from PySide6.QtGui import QIcon
-import os
+from core.paths import resource_path
 
 class MemberListPage(QWidget):
     # Signal to refresh members list externally if needed
@@ -23,8 +23,8 @@ class MemberListPage(QWidget):
 
         # Header
         self.header = QLabel("Members")
+        self.header.setObjectName("pageHeader")
         self.header.setAlignment(Qt.AlignCenter)
-        self.header.setStyleSheet("font-size: 20px; font-weight: bold; margin-bottom: 10px;")
         self.layout.addWidget(self.header)
 
         # Search Bar
@@ -52,15 +52,14 @@ class MemberListPage(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet("QTableWidget { background-color: #2E2E2E; color: #C5C6C7; }")
         self.table.cellDoubleClicked.connect(self.on_cell_double_clicked)
         self.members_layout.addWidget(self.table)
 
         # Buttons Layout
         self.members_buttons_layout = QHBoxLayout()
-        self.refresh_button = QPushButton(QIcon(os.path.join("resources", "icons", "refresh.png")), "Refresh")
+        self.refresh_button = QPushButton(QIcon(resource_path("icons", "refresh.png")), "Refresh")
         self.refresh_button.setToolTip("Refresh the members list")
-        self.delete_button = QPushButton(QIcon(os.path.join("resources", "icons", "delete.png")), "Delete Member")
+        self.delete_button = QPushButton(QIcon(resource_path("icons", "delete.png")), "Delete Member")
         self.delete_button.setToolTip("Delete the selected member(s)")
         self.members_buttons_layout.addWidget(self.refresh_button)
         self.members_buttons_layout.addWidget(self.delete_button)

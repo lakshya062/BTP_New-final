@@ -5,9 +5,9 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import Qt, QSize
-import os
 
 from core.config import exercise_config  # Import exercise_config
+from core.paths import resource_path
 
 class AddExerciseDialog(QDialog):
     def __init__(self, available_cams, parent=None):
@@ -52,8 +52,8 @@ class AddExerciseDialog(QDialog):
 
         # Buttons
         buttons_layout = QHBoxLayout()
-        self.ok_button = QPushButton(QIcon(os.path.join("resources", "icons", "ok.png")), "OK")
-        self.cancel_button = QPushButton(QIcon(os.path.join("resources", "icons", "cancel.png")), "Cancel")
+        self.ok_button = QPushButton(QIcon(resource_path("icons", "ok.png")), "OK")
+        self.cancel_button = QPushButton(QIcon(resource_path("icons", "cancel.png")), "Cancel")
         self.ok_button.setToolTip("Confirm and add the exercise")
         self.cancel_button.setToolTip("Cancel and close the dialog")
         buttons_layout.addStretch()

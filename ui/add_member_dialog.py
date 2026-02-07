@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QDate
 from PySide6.QtGui import QIcon
-import os
+from core.paths import resource_path
 
 class AddMemberDialog(QDialog):
     def __init__(self, db_handler, parent=None):
@@ -58,8 +58,8 @@ class AddMemberDialog(QDialog):
     
         # Buttons
         self.buttons_layout = QHBoxLayout()
-        self.save_button = QPushButton(QIcon(os.path.join("resources", "icons", "save.png")), "Save")
-        self.cancel_button = QPushButton(QIcon(os.path.join("resources", "icons", "cancel.png")), "Cancel")
+        self.save_button = QPushButton(QIcon(resource_path("icons", "save.png")), "Save")
+        self.cancel_button = QPushButton(QIcon(resource_path("icons", "cancel.png")), "Cancel")
         self.save_button.setToolTip("Save the new member")
         self.cancel_button.setToolTip("Cancel and close the dialog")
         self.buttons_layout.addStretch()

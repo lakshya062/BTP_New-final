@@ -1,12 +1,14 @@
 # core/database.py
 
 import sqlite3
-from datetime import datetime
-import uuid
 import logging
 import json
 import threading
 import time
+import os
+
+logger = logging.getLogger(__name__)
+
 
 class DatabaseHandler:
     _instance = None
@@ -31,13 +33,15 @@ class DatabaseHandler:
             timeout=30,  # Wait up to 30 seconds for the lock
             isolation_level=None  # Autocommit mode
         )
-        self.connection.execute("PRAGMA foreign_keys = ON;")  # Enable foreign keys
+        self.connection.execute("PRAGMA foreign_keys = ON;")
+        self.connection.execute("PRAGMA journal_mode = WAL;")
+        self.connection.execute("PRAGMA synchronous = NORMAL;")
         self.cursor = self.connection.cursor()
+        try:
+            os.chmod(self.local_db_file, 0o600)
+        except OSError:
+            pass
         self.setup_local_db()
-
-        # Configure logging
-        logging.basicConfig(level=logging.INFO, filename='database.log',
-                            format='%(asctime)s - %(levelname)s - %(message)s')
 
     def setup_local_db(self):
         """Create members and exercise_data tables if they don't exist."""
@@ -65,10 +69,22 @@ class DatabaseHandler:
                         FOREIGN KEY (user_id) REFERENCES members (user_id) ON DELETE CASCADE
                     )
                 ''')
+                self.cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_members_username ON members(username)"
+                )
+                self.cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_exercise_user_id ON exercise_data(user_id)"
+                )
+                self.cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_exercise_timestamp ON exercise_data(timestamp)"
+                )
+                self.cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_exercise_name ON exercise_data(exercise)"
+                )
                 self.connection.commit()
-                logging.info("Local SQLite database setup completed.")
+                logger.info("Local SQLite database setup completed.")
             except sqlite3.Error as e:
-                logging.error(f"SQLite error during setup_local_db: {e}")
+                logger.error("SQLite error during setup_local_db: %s", e)
 
     # Retry decorator for write operations
     def retry_db_operation(func):
@@ -80,16 +96,16 @@ class DatabaseHandler:
                     return func(self, *args, **kwargs)
                 except sqlite3.OperationalError as e:
                     if "database is locked" in str(e):
-                        logging.warning(f"Database is locked. Retrying in {delay} seconds...")
+                        logger.warning("Database is locked. Retrying in %s seconds...", delay)
                         time.sleep(delay)
                         delay *= 2  # Exponential backoff
                     else:
-                        logging.error(f"SQLite OperationalError: {e}")
+                        logger.error("SQLite OperationalError: %s", e)
                         raise
                 except sqlite3.Error as e:
-                    logging.error(f"SQLite error in {func.__name__}: {e}")
+                    logger.error("SQLite error in %s: %s", func.__name__, e)
                     raise
-            logging.error(f"Failed to execute {func.__name__} after {max_retries} retries.")
+            logger.error("Failed to execute %s after %s retries.", func.__name__, max_retries)
             return False
         return wrapper
 
@@ -110,7 +126,7 @@ class DatabaseHandler:
                     }
                 return None
         except sqlite3.Error as e:
-            logging.error(f"SQLite error in get_member_info_local: {e}")
+            logger.error("SQLite error in get_member_info_local: %s", e)
             return None
 
     @retry_db_operation
@@ -128,13 +144,14 @@ class DatabaseHandler:
                     member_info.get("membership", "NA"),
                     member_info["joined_on"]
                 ))
-                logging.info(f"Inserted member {member_info['username']} into local DB.")
+                self.connection.commit()
+                logger.info("Inserted member %s into local DB.", member_info["username"])
                 return True
         except sqlite3.IntegrityError as e:
-            logging.error(f"IntegrityError while inserting member: {e}")
+            logger.error("IntegrityError while inserting member: %s", e)
             return False
         except sqlite3.Error as e:
-            logging.error(f"SQLite error while inserting member: {e}")
+            logger.error("SQLite error while inserting member: %s", e)
             return False
 
     @retry_db_operation
@@ -146,7 +163,7 @@ class DatabaseHandler:
                 self.cursor.execute('SELECT user_id FROM members WHERE username = ?', (username,))
                 user_row = self.cursor.fetchone()
                 if not user_row:
-                    logging.warning(f"No member found with username: {username}")
+                    logger.warning("No member found with username: %s", username)
                     return False
                 user_id = user_row[0]
 
@@ -154,22 +171,23 @@ class DatabaseHandler:
                 self.cursor.execute('DELETE FROM exercise_data WHERE exercise_data.user_id = ?', (user_id,))
                 self.cursor.execute('DELETE FROM members WHERE username = ?', (username,))
                 if self.cursor.rowcount > 0:
-                    # Ensure exercise data is deleted
-                    remaining_exercises = self.cursor.fetchall()
+                    self.connection.commit()
+                    self.cursor.execute('SELECT COUNT(*) FROM exercise_data WHERE user_id = ?', (user_id,))
+                    remaining_exercises = self.cursor.fetchone()[0]
                     if not remaining_exercises:
-                        logging.info(f"Deleted member {username} and associated exercise data from local DB.")
+                        logger.info("Deleted member %s and associated exercise data from local DB.", username)
                         return True
                     else:
-                        logging.error(f"Exercise data for user {username} was not fully deleted.")
+                        logger.error("Exercise data for user %s was not fully deleted.", username)
                         return False
                 else:
-                    logging.warning(f"No member found with username: {username}")
+                    logger.warning("No member found with username: %s", username)
                     return False
         except sqlite3.IntegrityError as e:
-            logging.error(f"IntegrityError while deleting member: {e}")
+            logger.error("IntegrityError while deleting member: %s", e)
             return False
         except sqlite3.Error as e:
-            logging.error(f"SQLite error while deleting member: {e}")
+            logger.error("SQLite error while deleting member: %s", e)
             return False
 
 
@@ -190,7 +208,7 @@ class DatabaseHandler:
                     })
                 return members
         except sqlite3.Error as e:
-            logging.error(f"SQLite error in get_all_members_local: {e}")
+            logger.error("SQLite error in get_all_members_local: %s", e)
             return []
 
     def get_member_info(self, username):
@@ -221,13 +239,13 @@ class DatabaseHandler:
                     record['date']
                 ))
                 self.connection.commit()
-                logging.info(f"Inserted exercise data for user {record['user_id']} into local DB.")
+                logger.info("Inserted exercise data for user %s into local DB.", record["user_id"])
                 return True
         except sqlite3.IntegrityError as ie:
-            logging.error(f"IntegrityError while inserting exercise data: {ie}")
+            logger.error("IntegrityError while inserting exercise data: %s", ie)
             return False
         except sqlite3.Error as e:
-            logging.error(f"SQLite error while inserting exercise data: {e}")
+            logger.error("SQLite error while inserting exercise data: %s", e)
             return False
 
     def get_exercise_data_for_user_local(self, user_id):
@@ -250,7 +268,7 @@ class DatabaseHandler:
                     })
                 return data
         except sqlite3.Error as e:
-            logging.error(f"SQLite error in get_exercise_data_for_user_local: {e}")
+            logger.error("SQLite error in get_exercise_data_for_user_local: %s", e)
             return []
 
     def get_exercise_data_for_user(self, user_id):
@@ -262,9 +280,9 @@ class DatabaseHandler:
         try:
             with self.lock:
                 self.connection.close()
-                logging.info("Closed SQLite connection.")
+                logger.info("Closed SQLite connection.")
         except sqlite3.Error as e:
-            logging.error(f"SQLite error while closing connection: {e}")
+            logger.error("SQLite error while closing connection: %s", e)
     
     # Additional Methods Added Below
 
@@ -274,10 +292,10 @@ class DatabaseHandler:
             with self.lock:
                 self.cursor.execute('SELECT COUNT(*) FROM members')
                 count = self.cursor.fetchone()[0]
-                logging.info(f"Total members: {count}")
+                logger.info("Total members: %s", count)
                 return count
         except sqlite3.Error as e:
-            logging.error(f"SQLite error in get_total_members: {e}")
+            logger.error("SQLite error in get_total_members: %s", e)
             return 0
 
     def get_active_exercises(self):
@@ -287,10 +305,10 @@ class DatabaseHandler:
                 # Assuming 'active exercises' refers to distinct exercises recorded
                 self.cursor.execute('SELECT COUNT(DISTINCT exercise) FROM exercise_data')
                 count = self.cursor.fetchone()[0]
-                logging.info(f"Active exercises: {count}")
+                logger.info("Active exercises: %s", count)
                 return count
         except sqlite3.Error as e:
-            logging.error(f"SQLite error in get_active_exercises: {e}")
+            logger.error("SQLite error in get_active_exercises: %s", e)
             return 0
         
     def get_recent_activities(self, limit=5):
@@ -298,7 +316,8 @@ class DatabaseHandler:
         try:
             with self.lock:
                 self.cursor.execute('''
-                    SELECT members.username, exercise_data.exercise, exercise_data.timestamp
+                    SELECT members.username, exercise_data.exercise, exercise_data.set_count,
+                           exercise_data.rep_data, exercise_data.timestamp
                     FROM exercise_data
                     JOIN members ON exercise_data.user_id = members.user_id
                     ORDER BY exercise_data.timestamp DESC
@@ -307,15 +326,18 @@ class DatabaseHandler:
                 rows = self.cursor.fetchall()
                 activities = []
                 for row in rows:
+                    rep_data = json.loads(row[3]) if row[3] else []
                     activities.append({
                         "username": row[0],
                         "exercise": row[1],
-                        "timestamp": row[2]
+                        "set_count": row[2] if row[2] else 0,
+                        "rep_count": len(rep_data),
+                        "timestamp": row[4]
                     })
-                logging.info(f"Retrieved {len(activities)} recent activities.")
+                logger.info("Retrieved %s recent activities.", len(activities))
                 return activities
-        except sqlite3.Error as e:
-            logging.error(f"SQLite error in get_recent_activities: {e}")
+        except (sqlite3.Error, json.JSONDecodeError) as e:
+            logger.error("Error in get_recent_activities: %s", e)
             return []
         
     def get_total_sets(self):
@@ -325,10 +347,10 @@ class DatabaseHandler:
                 self.cursor.execute('SELECT SUM(set_count) FROM exercise_data')
                 result = self.cursor.fetchone()[0]
                 count = result if result else 0
-                logging.info(f"Total sets: {count}")
+                logger.info("Total sets: %s", count)
                 return count
         except sqlite3.Error as e:
-            logging.error(f"SQLite error in get_total_sets: {e}")
+            logger.error("SQLite error in get_total_sets: %s", e)
             return 0
 
     def get_total_reps(self):
@@ -341,11 +363,11 @@ class DatabaseHandler:
                 for row in rows:
                     rep_data = json.loads(row[0]) if row[0] else []
                     total_reps += len(rep_data)
-                logging.info(f"Total reps: {total_reps}")
+                logger.info("Total reps: %s", total_reps)
                 return total_reps
         except sqlite3.Error as e:
-            logging.error(f"SQLite error in get_total_reps: {e}")
+            logger.error("SQLite error in get_total_reps: %s", e)
             return 0
         except json.JSONDecodeError as je:
-            logging.error(f"JSON decode error in get_total_reps: {je}")
+            logger.error("JSON decode error in get_total_reps: %s", je)
             return 0

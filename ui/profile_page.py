@@ -4,6 +4,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QHBoxLayout, QFrame
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QPixmap
 import os
+from core.paths import resource_path
 
 class ProfilePage(QWidget):
     def __init__(self):
@@ -13,8 +14,8 @@ class ProfilePage(QWidget):
 
         # Header
         self.header = QLabel("Gym Owner Profile")
+        self.header.setObjectName("pageHeader")
         self.header.setAlignment(Qt.AlignCenter)
-        self.header.setStyleSheet("font-size: 24px; font-weight: bold; margin-bottom: 20px;")
         self.layout.addWidget(self.header)
 
         # Profile Picture and Info
@@ -25,7 +26,7 @@ class ProfilePage(QWidget):
         self.profile_pic.setFixedSize(200, 200)
         self.profile_pic.setStyleSheet("border: 2px solid #007ACC; border-radius: 100px;")
         # Load a default profile picture or a placeholder
-        default_pic_path = os.path.join("resources", "profiles", "owner.png")
+        default_pic_path = resource_path("profiles", "owner.png")
         if os.path.exists(default_pic_path):
             pixmap = QPixmap(default_pic_path).scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.profile_pic.setPixmap(pixmap)
@@ -89,7 +90,7 @@ class ProfilePage(QWidget):
         self.address_label.setText(f"Address: 123 Fitness Ave, Gym City")
 
         # Update Profile Picture if available
-        profile_pic_path = os.path.join("resources", "profiles", f"{username}.png")
+        profile_pic_path = resource_path("profiles", f"{username}.png")
         if os.path.exists(profile_pic_path):
             pixmap = QPixmap(profile_pic_path).scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.profile_pic.setPixmap(pixmap)

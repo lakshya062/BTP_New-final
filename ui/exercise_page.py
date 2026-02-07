@@ -7,46 +7,61 @@ from PySide6.QtGui import QPixmap, QImage, QFont, QIcon
 from PySide6.QtCore import Qt, Slot, Signal
 import numpy as np
 from ui.worker import ExerciseWorker
-import os
+from core.paths import resource_path
 
 class ExercisePage(QWidget):
     status_message = Signal(str)
     counters_update = Signal(int, int)
     user_recognized_signal = Signal(dict)
     unknown_user_detected = Signal(object)
+    new_user_registration_signal = Signal(str, bool)
     worker_started = Signal()
 
-    def __init__(self, db_handler, camera_index, exercise_choice, face_recognizer, parent=None):
+    def __init__(
+        self,
+        db_handler,
+        camera_index,
+        exercise_choice,
+        face_recognizer,
+        assigned_user_name=None,
+        aruco_dict_type="DICT_5X5_100",
+        parent=None,
+    ):
         super().__init__(parent)
         self.db_handler = db_handler
         self.camera_index = camera_index
         self.exercise_choice = exercise_choice
         self.face_recognizer = face_recognizer
+        self.assigned_user_name = assigned_user_name
+        self.aruco_dict_type = aruco_dict_type
 
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
 
         self.title_label = QLabel(f"Exercise: {self.exercise_choice.replace('_', ' ').title()}")
+        self.title_label.setObjectName("exerciseTitle")
         self.title_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
         self.title_label.setAlignment(Qt.AlignCenter)
-        self.title_label.setStyleSheet("color: #FFFFFF;")
         self.layout.addWidget(self.title_label, alignment=Qt.AlignCenter)
 
         self.video_label = QLabel("Video Feed")
+        self.video_label.setObjectName("exerciseVideo")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setFixedSize(1280, 720)
-        self.video_label.setStyleSheet("background-color: #1E1E1E; border: 2px solid #007ACC; border-radius: 8px;")
 
         self.layout.addWidget(self.video_label, alignment=Qt.AlignCenter)
 
         self.controls_group = QGroupBox("Controls")
+        self.controls_group.setObjectName("exerciseControlsGroup")
         self.controls_layout = QHBoxLayout()
         self.controls_group.setLayout(self.controls_layout)
 
-        self.start_button = QPushButton(QIcon(os.path.join("resources", "icons", "start.png")), "Start")
+        self.start_button = QPushButton(QIcon(resource_path("icons", "start.png")), "Start")
         self.start_button.setToolTip("Start monitoring exercise")
-        self.stop_button = QPushButton(QIcon(os.path.join("resources", "icons", "stop.png")), "Stop")
+        self.start_button.setMinimumHeight(42)
+        self.stop_button = QPushButton(QIcon(resource_path("icons", "stop.png")), "Stop")
         self.stop_button.setToolTip("Stop monitoring exercise")
+        self.stop_button.setMinimumHeight(42)
         self.stop_button.setEnabled(False)
 
         self.controls_layout.addWidget(self.start_button)
@@ -55,11 +70,11 @@ class ExercisePage(QWidget):
 
         self.rep_label = QLabel("Reps: 0")
         self.set_label = QLabel("Sets: 0")
+        self.rep_label.setObjectName("counterLabel")
+        self.set_label.setObjectName("counterLabel")
         counter_font = QFont("Segoe UI", 12, QFont.Bold)
         self.rep_label.setFont(counter_font)
         self.set_label.setFont(counter_font)
-        self.rep_label.setStyleSheet("color: #FFFFFF;")
-        self.set_label.setStyleSheet("color: #FFFFFF;")
 
         self.counters_layout = QHBoxLayout()
         self.counters_layout.addWidget(self.rep_label)
@@ -82,13 +97,16 @@ class ExercisePage(QWidget):
                 db_handler=self.db_handler,
                 camera_index=self.camera_index,
                 exercise_choice=self.exercise_choice,
-                face_recognizer=self.face_recognizer
+                face_recognizer=self.face_recognizer,
+                assigned_user_name=self.assigned_user_name,
+                aruco_dict_type=self.aruco_dict_type,
             )
             self.worker.frame_signal.connect(self.update_frame)
             self.worker.status_signal.connect(self.emit_status_message)
             self.worker.counters_signal.connect(self.emit_counters_update)
             self.worker.user_recognized_signal.connect(self.handle_user_recognized)
             self.worker.unknown_user_detected.connect(self.prompt_new_user_name)
+            self.worker.new_user_registration_signal.connect(self.handle_new_user_registration_result)
             self.worker.data_updated.connect(self.on_data_updated)
             self.worker.started.connect(self.on_worker_started)
 
@@ -106,6 +124,7 @@ class ExercisePage(QWidget):
                 self.worker.counters_signal.disconnect(self.emit_counters_update)
                 self.worker.user_recognized_signal.disconnect(self.handle_user_recognized)
                 self.worker.unknown_user_detected.disconnect(self.prompt_new_user_name)
+                self.worker.new_user_registration_signal.disconnect(self.handle_new_user_registration_result)
                 self.worker.data_updated.disconnect(self.on_data_updated)
                 self.worker.started.disconnect(self.on_worker_started)
             except TypeError as e:
@@ -168,10 +187,11 @@ class ExercisePage(QWidget):
 
     @Slot()
     def on_data_updated(self):
-        pass
+        self.status_message.emit("Exercise data updated.")
 
-    def handle_new_user_registration(self, username):
-        pass
+    @Slot(str, bool)
+    def handle_new_user_registration_result(self, username, success):
+        self.new_user_registration_signal.emit(username, success)
 
     def start_user_registration(self, user_name):
         if self.worker:

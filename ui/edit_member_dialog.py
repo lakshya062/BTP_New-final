@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QDate
 from PySide6.QtGui import QIcon
-import os
+from core.paths import resource_path
 
 class EditMemberDialog(QDialog):
     def __init__(self, current_info, parent=None):
@@ -39,7 +39,7 @@ class EditMemberDialog(QDialog):
             jdate = QDate.fromString(joined_on, "yyyy-MM-dd")
             if not jdate.isValid():
                 jdate = QDate.currentDate()
-        except:
+        except Exception:
             jdate = QDate.currentDate()
         self.joined_edit.setDate(jdate)
         self.joined_edit.setCalendarPopup(True)
@@ -54,8 +54,8 @@ class EditMemberDialog(QDialog):
 
         # Buttons
         buttons_layout = QHBoxLayout()
-        self.save_button = QPushButton(QIcon(os.path.join("resources", "icons", "save.png")), "Save")
-        self.cancel_button = QPushButton(QIcon(os.path.join("resources", "icons", "cancel.png")), "Cancel")
+        self.save_button = QPushButton(QIcon(resource_path("icons", "save.png")), "Save")
+        self.cancel_button = QPushButton(QIcon(resource_path("icons", "cancel.png")), "Cancel")
         self.save_button.setToolTip("Save changes")
         self.cancel_button.setToolTip("Cancel and close the dialog")
         buttons_layout.addStretch()

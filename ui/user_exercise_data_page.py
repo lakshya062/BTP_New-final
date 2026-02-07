@@ -4,7 +4,7 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QTableWidget, QTable
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtGui import QFont, QIcon
 from datetime import datetime
-import os
+from core.paths import resource_path
 
 class UserExerciseDataPage(QWidget):
     def __init__(self, db_handler, user_id, embedded=False):
@@ -48,7 +48,7 @@ class UserExerciseDataPage(QWidget):
 
         # Back Button if Embedded
         if self.embedded:
-            self.back_button = QPushButton(QIcon(os.path.join("resources", "icons", "back.png")), "Back to Members")
+            self.back_button = QPushButton(QIcon(resource_path("icons", "back.png")), "Back to Members")
             self.back_button.setToolTip("Return to the members list")
             self.exercises_layout.addWidget(self.back_button, alignment=Qt.AlignRight)
 
@@ -77,7 +77,7 @@ class UserExerciseDataPage(QWidget):
         self.sessions_table.cellDoubleClicked.connect(self.on_session_double_clicked)
         self.sessions_layout.addWidget(self.sessions_table)
 
-        self.back_to_exercises_button = QPushButton(QIcon(os.path.join("resources", "icons", "back.png")), "Back to Exercises")
+        self.back_to_exercises_button = QPushButton(QIcon(resource_path("icons", "back.png")), "Back to Exercises")
         self.back_to_exercises_button.setToolTip("Return to the exercises list")
         self.back_to_exercises_button.clicked.connect(self.back_to_exercises)
         self.sessions_layout.addWidget(self.back_to_exercises_button, alignment=Qt.AlignRight)
@@ -105,7 +105,7 @@ class UserExerciseDataPage(QWidget):
         self.rep_table.setStyleSheet("QTableWidget { background-color: #2E2E2E; color: #C5C6C7; }")
         self.rep_details_layout.addWidget(self.rep_table)
 
-        self.back_to_sessions_button = QPushButton(QIcon(os.path.join("resources", "icons", "back.png")), "Back to Sessions")
+        self.back_to_sessions_button = QPushButton(QIcon(resource_path("icons", "back.png")), "Back to Sessions")
         self.back_to_sessions_button.setToolTip("Return to the sessions list")
         self.back_to_sessions_button.clicked.connect(self.back_to_sessions)
         self.rep_details_layout.addWidget(self.back_to_sessions_button, alignment=Qt.AlignRight)

@@ -3,12 +3,15 @@
 import sys
 import os
 from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen
-from PySide6.QtGui import QFont, QPixmap
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtCore import Qt
+from core.logging_config import configure_logging
+from core.paths import resource_path
 from ui.main_window import MainWindow
 
 def main():
     try:
+        configure_logging()
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
         app = QApplication(sys.argv)
         app.setApplicationName("Smart Gym Client System")
@@ -16,24 +19,20 @@ def main():
         app.setOrganizationDomain("smartgym.com")
 
         # Set application icon
-        icon_path = os.path.join("resources", "icons", "app_icon.png")
+        icon_path = resource_path("icons", "app_icon.png")
         if os.path.exists(icon_path):
-            app.setWindowIcon(QPixmap(icon_path))
-        
-        # Increase font size and set font family
-        # font = QFont("Segoe UI", 10)
-        # font.setPointSize(10)
-        # app.setFont(font)
+            app.setWindowIcon(QIcon(icon_path))
 
         # Optional: Add Splash Screen
-        splash_pix = QPixmap(os.path.join("resources", "icons", "splash.png")) if os.path.exists(os.path.join("resources", "icons", "splash.png")) else QPixmap()
+        splash_path = resource_path("icons", "splash.png")
+        splash_pix = QPixmap(splash_path) if os.path.exists(splash_path) else QPixmap()
         if not splash_pix.isNull():
             splash = QSplashScreen(splash_pix, Qt.WindowStaysOnTopHint)
             splash.setMask(splash_pix.mask())
             splash.show()
             app.processEvents()
 
-        stylesheet_path = os.path.join("resources", "styles.qss")
+        stylesheet_path = resource_path("styles.qss")
         if os.path.exists(stylesheet_path):
             with open(stylesheet_path, "r") as f:
                 app.setStyleSheet(f.read())
