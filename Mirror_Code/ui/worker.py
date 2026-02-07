@@ -4,6 +4,8 @@ import cv2
 import face_recognition as fr_lib
 import mediapipe as mp
 import logging
+import os
+import uuid
 from datetime import datetime
 
 from PySide6.QtCore import QThread, Signal
@@ -107,6 +109,9 @@ class ExerciseWorker(QThread):
         self.display_user_name = self.assigned_user_name
         self.last_audio_message = ""
         self.aruco_dict_type = ArucoDetector.normalize_dict_type(aruco_dict_type)
+        self.is_edge_mode = os.environ.get("SMART_MIRROR_EDGE_MODE", "0") == "1"
+        default_disable_aruco = "1" if self.is_edge_mode else "0"
+        self.disable_aruco = os.environ.get("SMART_MIRROR_DISABLE_ARUCO", default_disable_aruco) == "1"
 
     def request_stop(self):
         self.stop_requested = True
@@ -494,12 +499,19 @@ class ExerciseWorker(QThread):
                 min_tracking_confidence=0.5,
                 model_complexity=1,
             )
-            aruco_detector = ArucoDetector(dict_type=self.aruco_dict_type)
-            logging.info(
-                "ExerciseWorker cam_%s using ArUco dictionary: %s",
-                self.camera_index,
-                aruco_detector.get_dict_type(),
-            )
+            aruco_detector = None
+            if self.disable_aruco:
+                logging.info(
+                    "ExerciseWorker cam_%s running with ArUco disabled (SMART_MIRROR_DISABLE_ARUCO=1).",
+                    self.camera_index,
+                )
+            else:
+                aruco_detector = ArucoDetector(dict_type=self.aruco_dict_type)
+                logging.info(
+                    "ExerciseWorker cam_%s using ArUco dictionary: %s",
+                    self.camera_index,
+                    aruco_detector.get_dict_type(),
+                )
 
             if self.exercise_choice not in exercise_config:
                 self.status_signal.emit(
@@ -822,33 +834,53 @@ class ExerciseWorker(QThread):
                                 if self.known_frames >= self.KNOWN_FRAME_THRESHOLD:
                                     logging.info(f"User recognized: {recognized_user}")
                                     user_info = self.db_handler.get_member_info(recognized_user)
-                                    if user_info:
-                                        self.user_recognized_signal.emit(user_info)
-                                        self.status_signal.emit(
-                                            f"Face recognized as {recognized_user}, starting exercise analysis."
-                                        )
-                                        logging.info(
-                                            f"Starting exercise analysis for user: {recognized_user}"
-                                        )
-                                        self.current_user_info = user_info
-                                        self.display_user_name = recognized_user
-                                        self.exercise_analyzer = ExerciseAnalyzer(
-                                            self.exercise_choice,
-                                            aruco_detector,
-                                            self.db_handler,
-                                            user_id=user_info.get("user_id"),
-                                        )
-                                        self.exercise_analysis_active = True
-                                        self.face_recognition_active = False
-                                        self._reset_face_recognition_state()
-                                    else:
-                                        self.status_signal.emit(
-                                            f"Face recognized as {recognized_user}, but no member info found."
-                                        )
-                                        logging.warning(
-                                            "No member info found for recognized user %s.",
-                                            recognized_user,
-                                        )
+                                    if not user_info:
+                                        # Edge nodes can have face embeddings before member rows are synced.
+                                        # Auto-create a lightweight local member so analysis can continue.
+                                        provisional_member = {
+                                            "user_id": str(uuid.uuid4()),
+                                            "username": recognized_user,
+                                            "email": "NA",
+                                            "membership": "NA",
+                                            "joined_on": datetime.utcnow().strftime("%Y-%m-%d"),
+                                        }
+                                        try:
+                                            inserted = self.db_handler.insert_member_local(provisional_member)
+                                            user_info = self.db_handler.get_member_info(recognized_user)
+                                            logging.info(
+                                                "Auto-provisioned local member for %s (inserted=%s).",
+                                                recognized_user,
+                                                inserted,
+                                            )
+                                        except Exception as exc:
+                                            logging.error(
+                                                "Failed to auto-provision member %s: %s",
+                                                recognized_user,
+                                                exc,
+                                            )
+                                            user_info = None
+
+                                        if not user_info:
+                                            user_info = provisional_member
+
+                                    self.user_recognized_signal.emit(user_info)
+                                    self.status_signal.emit(
+                                        f"Face recognized as {recognized_user}, starting exercise analysis."
+                                    )
+                                    logging.info(
+                                        f"Starting exercise analysis for user: {recognized_user}"
+                                    )
+                                    self.current_user_info = user_info
+                                    self.display_user_name = recognized_user
+                                    self.exercise_analyzer = ExerciseAnalyzer(
+                                        self.exercise_choice,
+                                        aruco_detector,
+                                        self.db_handler,
+                                        user_id=user_info.get("user_id"),
+                                    )
+                                    self.exercise_analysis_active = True
+                                    self.face_recognition_active = False
+                                    self._reset_face_recognition_state()
                         else:
                             self.unknown_frames = max(0, self.unknown_frames - self.UNKNOWN_FRAME_DECAY)
                             self.known_frames = max(0, self.known_frames - self.KNOWN_FRAME_DECAY)

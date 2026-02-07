@@ -1,9 +1,24 @@
 {
+    "aruco_dict_type": "DICT_5X5_100",
     "exercises": [
         {
             "camera_index": 0,
             "exercise": "bicep_curl",
             "user_name": "Lakshya"
+        }
+    ],
+    "devices": [
+        {
+            "ip": "192.168.1.38",
+            "hostname": "lakshya-sharan",
+            "interface": "en1",
+            "linux_verified": true,
+            "username": "lakshya",
+            "password": "LAKSHYA@3738",
+            "remote_dir": "~/smart_mirror_edge",
+            "display": ":1",
+            "install_deps": false,
+            "last_deployed_at": "2026-02-07T21:26:02.368984"
         }
     ]
 }

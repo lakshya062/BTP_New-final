@@ -2,16 +2,39 @@
 
 import sys
 import os
+import faulthandler
+import warnings
 from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtCore import Qt
 from core.logging_config import configure_logging
-from core.paths import resource_path
+from core.paths import project_path, resource_path
 from ui.main_window import MainWindow
+
+_fault_log_file = None
+
+
+def _configure_runtime_diagnostics():
+    global _fault_log_file
+    try:
+        fault_log_path = project_path("edge_fault.log")
+        _fault_log_file = open(fault_log_path, "a", buffering=1)
+        faulthandler.enable(file=_fault_log_file, all_threads=True)
+    except Exception:
+        _fault_log_file = None
+
+    # Keep edge runtime logs clean; this warning is non-fatal and very noisy.
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*SymbolDatabase\.GetPrototype\(\) is deprecated.*",
+        category=UserWarning,
+    )
+
 
 def main():
     try:
         configure_logging()
+        _configure_runtime_diagnostics()
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
         app = QApplication(sys.argv)
         app.setApplicationName("Smart Gym Client System")

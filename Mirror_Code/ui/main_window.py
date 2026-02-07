@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QStatusBar, QPushButton, QHBoxLayout, QComboBox, QInputDialog, QDialog, QLabel, QSizePolicy
 )
 from PySide6.QtGui import QFont, QIcon, QGuiApplication, QPixmap, QImage
-from PySide6.QtCore import Qt, QTimer, Slot, QSize
+from PySide6.QtCore import Qt, QTimer, Slot, QSize, QThread, Signal
 from screeninfo import get_monitors
 
 import cv2
@@ -20,12 +20,15 @@ from functools import partial
 from core.database import DatabaseHandler
 from core.face_recognition import FaceRecognizer
 from core.aruco_detection import ArucoDetector
+from core.config import exercise_config
+from core.edge_device_manager import EdgeDeviceManager
 from core.paths import project_path, resource_path
 from ui.exercise_page import ExercisePage
 from ui.profile_page import ProfilePage
 from ui.member_list_page import MemberListPage
 from ui.cameras_overview_page import CamerasOverviewPage
 from ui.add_exercise_dialog import AddExerciseDialog
+from ui.add_device_dialog import AddDeviceDialog
 from ui.add_member_dialog import AddMemberDialog
 from ui.home_page import HomePage
 
@@ -37,6 +40,52 @@ def detect_available_cameras(max_cameras=10):
             available_cams.append(i)
         cap.release()
     return available_cams
+
+
+class EdgeDeployWorker(QThread):
+    progress_signal = Signal(str)
+    finished_signal = Signal(object)
+
+    def __init__(self, edge_device_manager, edge_devices, parent=None):
+        super().__init__(parent)
+        self.edge_device_manager = edge_device_manager
+        self.edge_devices = edge_devices
+
+    def run(self):
+        success_ips = []
+        failures = []
+        for edge in self.edge_devices:
+            if self.isInterruptionRequested():
+                break
+            ip = (edge.get("ip") or "").strip()
+            username = (edge.get("username") or "").strip()
+            password = (edge.get("password") or "").strip()
+            remote_dir = (edge.get("remote_dir") or "~/smart_mirror_edge").strip()
+            display = (edge.get("display") or ":0").strip()
+            install_deps = bool(edge.get("install_deps", False))
+
+            if not ip:
+                continue
+
+            self.progress_signal.emit(f"Deploying edge device {ip}...")
+            result = self.edge_device_manager.deploy_and_launch(
+                ip=ip,
+                username=username,
+                password=password,
+                remote_dir=remote_dir,
+                display=display,
+                install_deps=install_deps,
+                progress_callback=self.progress_signal.emit,
+            )
+            if result.success:
+                success_ips.append(ip)
+                self.progress_signal.emit(f"Edge deployment successful for {ip}.")
+            else:
+                details = f" ({result.details})" if result.details else ""
+                failures.append(f"{ip}: {result.message}{details}")
+                self.progress_signal.emit(f"Edge deployment failed for {ip}.")
+
+        self.finished_signal.emit({"success_ips": success_ips, "failures": failures})
 
 class SmartMirrorWindow(QMainWindow):
     """
@@ -254,6 +303,8 @@ class MainWindow(QMainWindow):
         self.controls_layout.setSpacing(10)
         self.controls_layout.setContentsMargins(10, 10, 10, 10)
 
+        self.add_device_button = QPushButton(QIcon(resource_path("icons", "add.png")), "Add Device")
+        self.add_device_button.setToolTip("Discover and deploy code to an edge device")
         self.add_exercise_button = QPushButton(QIcon(resource_path("icons", "add.png")), "Add Exercise")
         self.add_exercise_button.setToolTip("Add a new exercise with a camera")
         self.delete_exercise_button = QPushButton(QIcon(resource_path("icons", "delete.png")), "Delete Exercise")
@@ -265,6 +316,7 @@ class MainWindow(QMainWindow):
         self.layout_selector.setCurrentIndex(1)
         self.layout_selector.setToolTip("Select Camera Layout")
 
+        self.controls_layout.addWidget(self.add_device_button)
         self.controls_layout.addWidget(self.add_exercise_button)
         self.controls_layout.addWidget(self.delete_exercise_button)
         self.controls_layout.addWidget(self.start_all_button)
@@ -274,6 +326,7 @@ class MainWindow(QMainWindow):
 
         self.main_layout.addLayout(self.controls_layout)
 
+        self.add_device_button.clicked.connect(self.add_device_dialog)
         self.add_exercise_button.clicked.connect(self.add_exercise_dialog)
         self.delete_exercise_button.clicked.connect(self.delete_current_exercise)
         self.start_all_button.clicked.connect(self.start_all_exercises)
@@ -285,9 +338,22 @@ class MainWindow(QMainWindow):
         self.exercise_pages = []
         self._mirror_slots = {}
         self._overview_slots = {}
+        self.edge_device_manager = EdgeDeviceManager(project_path())
+        self.edge_devices = []
+        self._edge_deploy_worker = None
+        self.is_edge_mode = os.environ.get("SMART_MIRROR_EDGE_MODE", "0") == "1"
+        self.edge_allow_close = os.environ.get("SMART_MIRROR_EDGE_ALLOW_CLOSE", "0") == "1"
+        self._is_shutting_down = False
         self.aruco_dict_type = "DICT_5X5_100"
         self.load_config()
+        self._ensure_edge_default_exercise()
         self.update_overview_tab()
+
+        if self.is_edge_mode:
+            self.add_device_button.setEnabled(False)
+            self.add_device_button.setVisible(False)
+            if os.environ.get("SMART_MIRROR_EDGE_AUTOSTART", "0") == "1":
+                QTimer.singleShot(1800, self.start_all_exercises)
 
         self.sync_timer = QTimer(self)
         self.sync_timer.timeout.connect(self.sync_local_data_to_sqlite)
@@ -369,6 +435,22 @@ class MainWindow(QMainWindow):
         if os.path.exists(self.CONFIG_FILE):
             with open(self.CONFIG_FILE, "r") as f:
                 data = json.load(f)
+            self.edge_devices = []
+            for item in data.get("devices", []):
+                self.edge_devices.append(
+                    {
+                        "ip": item.get("ip", ""),
+                        "hostname": item.get("hostname", ""),
+                        "interface": item.get("interface", ""),
+                        "linux_verified": bool(item.get("linux_verified", False)),
+                        "username": item.get("username", ""),
+                        "password": item.get("password", ""),
+                        "remote_dir": item.get("remote_dir", "~/smart_mirror_edge"),
+                        "display": item.get("display", ":0"),
+                        "install_deps": bool(item.get("install_deps", False)),
+                        "last_deployed_at": item.get("last_deployed_at", ""),
+                    }
+                )
             self.aruco_dict_type = ArucoDetector.normalize_dict_type(
                 data.get("aruco_dict_type", "DICT_5X5_100")
             )
@@ -386,15 +468,40 @@ class MainWindow(QMainWindow):
                 )
         else:
             with open(self.CONFIG_FILE, "w") as f:
-                json.dump({"aruco_dict_type": self.aruco_dict_type, "exercises": []}, f, indent=4)
+                json.dump(
+                    {"aruco_dict_type": self.aruco_dict_type, "exercises": [], "devices": []},
+                    f,
+                    indent=4,
+                )
 
     def save_config(self):
         exercises = []
         for (page, cam_idx, ex, user) in self.exercise_pages:
             exercises.append({"camera_index": cam_idx, "exercise": ex, "user_name": user})
-        data = {"aruco_dict_type": self.aruco_dict_type, "exercises": exercises}
+        data = {
+            "aruco_dict_type": self.aruco_dict_type,
+            "exercises": exercises,
+            "devices": self.edge_devices,
+        }
         with open(self.CONFIG_FILE, "w") as f:
             json.dump(data, f, indent=4)
+
+    def _ensure_edge_default_exercise(self):
+        if not self.is_edge_mode:
+            return
+        if self.exercise_pages:
+            return
+        if not exercise_config:
+            return
+        default_exercise = list(exercise_config.keys())[0]
+        self.add_exercise_page(
+            camera_index=0,
+            exercise=default_exercise,
+            user_name=None,
+            start_immediately=False,
+            aruco_dict_type=self.aruco_dict_type,
+        )
+        self.save_config()
 
     def add_exercise_dialog(self):
         available_cams = detect_available_cameras(max_cameras=10)
@@ -415,6 +522,122 @@ class MainWindow(QMainWindow):
             camera_index = int(cam_text.replace("cam_", ""))
             self.add_exercise_page(camera_index, exercise, user_name=user_name)
             self.save_config()
+
+    def add_device_dialog(self):
+        dialog = AddDeviceDialog(self.edge_device_manager, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        selection = dialog.get_selection()
+        device = selection["device"]
+        username = selection["username"]
+        password = selection["password"]
+        remote_dir = selection["remote_dir"]
+        display = selection["display"]
+        install_deps = selection["install_deps"]
+
+        if not device.ip:
+            QMessageBox.warning(self, "Add Device", "No edge device selected.")
+            return
+
+        self._upsert_edge_device(
+            device,
+            username=username,
+            password=password,
+            remote_dir=remote_dir,
+            display=display,
+            install_deps=install_deps,
+        )
+        self.save_config()
+        message = (
+            f"Edge device added.\n\n"
+            f"Host: {device.hostname or 'unknown'}\n"
+            f"IP: {device.ip}\n"
+            f"Code deploy/start will run automatically on Start All."
+        )
+        self.status_bar.showMessage(f"Edge device {device.ip} added.", 8000)
+        QMessageBox.information(self, "Add Device", message)
+
+    def _upsert_edge_device(self, device, username, password, remote_dir, display, install_deps):
+        record = {
+            "ip": device.ip,
+            "hostname": device.hostname,
+            "interface": device.interface,
+            "linux_verified": bool(device.linux_verified),
+            "username": username,
+            "password": password,
+            "remote_dir": remote_dir,
+            "display": display,
+            "install_deps": bool(install_deps),
+            "last_deployed_at": datetime.utcnow().isoformat(),
+        }
+        for idx, existing in enumerate(self.edge_devices):
+            if existing.get("ip") == device.ip:
+                self.edge_devices[idx] = record
+                return
+        self.edge_devices.append(record)
+
+    def _start_edge_deployments(self):
+        if self.is_edge_mode:
+            return True
+        if self._edge_deploy_worker and self._edge_deploy_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Edge Deployment",
+                "Edge deployment is already running.",
+            )
+            return False
+
+        if not self.edge_devices:
+            return True
+
+        self.start_all_button.setEnabled(False)
+        self.status_bar.showMessage("Deploying edge devices over local network...")
+
+        worker_payload = [dict(edge) for edge in self.edge_devices]
+        self._edge_deploy_worker = EdgeDeployWorker(
+            self.edge_device_manager,
+            worker_payload,
+            self,
+        )
+        self._edge_deploy_worker.progress_signal.connect(self.update_status)
+        self._edge_deploy_worker.finished_signal.connect(self._on_edge_deploy_finished)
+        self._edge_deploy_worker.start()
+        return False
+
+    @Slot(object)
+    def _on_edge_deploy_finished(self, payload):
+        success_ips = payload.get("success_ips", [])
+        failures = payload.get("failures", [])
+
+        deployed_count = 0
+        for edge in self.edge_devices:
+            if edge.get("ip") in success_ips:
+                edge["last_deployed_at"] = datetime.utcnow().isoformat()
+                deployed_count += 1
+        self.save_config()
+
+        if failures:
+            QMessageBox.warning(
+                self,
+                "Edge Deployment",
+                "Some edge devices failed to deploy:\n\n" + "\n".join(failures),
+            )
+            self.status_bar.showMessage(
+                f"Deployed {deployed_count} edge device(s); {len(failures)} failed.",
+                10000,
+            )
+        else:
+            self.status_bar.showMessage(
+                f"Deployed and started {deployed_count} edge device(s).",
+                8000,
+            )
+
+        if self._edge_deploy_worker:
+            self._edge_deploy_worker.deleteLater()
+            self._edge_deploy_worker = None
+        self.start_all_button.setEnabled(True)
+        self._start_local_exercises()
 
     def add_member_dialog(self):
         dialog = AddMemberDialog(self.db_handler, self)
@@ -504,6 +727,15 @@ class MainWindow(QMainWindow):
             exercise_page.worker._data_updated_connected = True
 
     def prompt_new_user_name(self, exercise_page):
+        if self.is_edge_mode:
+            # Edge runtime should not block camera processing with modal prompts.
+            logging.info("Unknown user detected in edge mode; registration prompt suppressed.")
+            self.status_bar.showMessage(
+                "Unknown user detected on edge. Registration prompt is disabled in edge mode.",
+                6000,
+            )
+            return
+
         username, ok = QInputDialog.getText(
             self, "New User Registration", "Enter username for the new user:"
         )
@@ -591,6 +823,11 @@ class MainWindow(QMainWindow):
             self.update_overview_tab()
 
     def start_all_exercises(self):
+        deploy_complete_immediately = self._start_edge_deployments()
+        if deploy_complete_immediately:
+            self._start_local_exercises()
+
+    def _start_local_exercises(self):
         available_cams = detect_available_cameras(max_cameras=10)
         missing = []
         for (page, cam_idx, ex, _) in self.exercise_pages:
@@ -658,6 +895,7 @@ class MainWindow(QMainWindow):
                 self._connect_overview_feed(page, cam_idx, ex)
 
     def update_status(self, message):
+        logging.info(message)
         self.status_bar.showMessage(message, 5000)
 
     def update_counters(self, reps, sets):
@@ -665,6 +903,8 @@ class MainWindow(QMainWindow):
             logging.debug("Counters updated reps=%s sets=%s", reps, sets)
 
     def sync_local_data_to_sqlite(self):
+        if self._is_shutting_down:
+            return
         try:
             self.home_page.refresh_summary()
             self.home_page.load_recent_activities()
@@ -672,22 +912,62 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logging.error("Dashboard refresh failed: %s", exc)
 
+    def _shutdown_runtime(self):
+        if self._is_shutting_down:
+            return
+        self._is_shutting_down = True
+
+        if self.sync_timer and self.sync_timer.isActive():
+            self.sync_timer.stop()
+
+        if self._edge_deploy_worker and self._edge_deploy_worker.isRunning():
+            self._edge_deploy_worker.requestInterruption()
+            self._edge_deploy_worker.wait(3000)
+
+        for (page, _, _, _) in self.exercise_pages[:]:
+            self._disconnect_mirror_feed(page)
+            self._disconnect_overview_feed(page)
+            page.stop_exercise()
+
+        # Final dashboard sync while DB is still open.
+        try:
+            self.home_page.refresh_summary()
+            self.home_page.load_recent_activities()
+            self.member_list_page.load_members()
+        except Exception as exc:
+            logging.error("Final dashboard refresh failed during shutdown: %s", exc)
+
+        self.db_handler.close_connections()
+        self.global_face_recognizer.close()
+
+        if self.smart_mirror_window:
+            self.smart_mirror_window.close()
+
     def closeEvent(self, event):
-        reply = QMessageBox.question(
-            self, 'Confirm Exit',
-            "Are you sure you want to exit the application?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        logging.info(
+            "MainWindow closeEvent received (edge_mode=%s, edge_allow_close=%s).",
+            self.is_edge_mode,
+            self.edge_allow_close,
         )
-        if reply == QMessageBox.Yes:
-            for (page, cam_idx, ex, _) in self.exercise_pages[:]:
-                self._disconnect_mirror_feed(page)
-                self._disconnect_overview_feed(page)
-                page.stop_exercise()
-            self.db_handler.close_connections()
-            self.global_face_recognizer.close()
-            self.sync_local_data_to_sqlite()
-            if self.smart_mirror_window:
-                self.smart_mirror_window.close()
-            event.accept()
-        else:
+
+        if self.is_edge_mode and not self.edge_allow_close:
+            logging.warning("Ignoring close event in edge mode (SMART_MIRROR_EDGE_ALLOW_CLOSE != 1).")
+            self.status_bar.showMessage(
+                "Edge runtime close blocked. Set SMART_MIRROR_EDGE_ALLOW_CLOSE=1 to allow closing.",
+                8000,
+            )
             event.ignore()
+            return
+
+        if not self.is_edge_mode:
+            reply = QMessageBox.question(
+                self, 'Confirm Exit',
+                "Are you sure you want to exit the application?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                event.ignore()
+                return
+
+        self._shutdown_runtime()
+        event.accept()

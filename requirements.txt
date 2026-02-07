@@ -74,6 +74,7 @@ oss2==2.17.0
 packaging==24.2
 pandas==2.3.3
 parso==0.8.5
+paramiko==3.5.1
 pexpect==4.9.0
 pillow==11.3.0
 platformdirs==4.5.0
