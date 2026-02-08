@@ -37,6 +37,9 @@ def main():
         _configure_runtime_diagnostics()
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
         app = QApplication(sys.argv)
+        is_edge_mode = os.environ.get("SMART_MIRROR_EDGE_MODE", "0") == "1"
+        if is_edge_mode:
+            app.setQuitOnLastWindowClosed(False)
         app.setApplicationName("Smart Gym Client System")
         app.setOrganizationName("SmartGym")
         app.setOrganizationDomain("smartgym.com")
@@ -46,14 +49,15 @@ def main():
         if os.path.exists(icon_path):
             app.setWindowIcon(QIcon(icon_path))
 
-        # Optional: Add Splash Screen
-        splash_path = resource_path("icons", "splash.png")
-        splash_pix = QPixmap(splash_path) if os.path.exists(splash_path) else QPixmap()
-        if not splash_pix.isNull():
-            splash = QSplashScreen(splash_pix, Qt.WindowStaysOnTopHint)
-            splash.setMask(splash_pix.mask())
-            splash.show()
-            app.processEvents()
+        # Optional: Add splash screen on main desktop app only.
+        if not is_edge_mode:
+            splash_path = resource_path("icons", "splash.png")
+            splash_pix = QPixmap(splash_path) if os.path.exists(splash_path) else QPixmap()
+            if not splash_pix.isNull():
+                splash = QSplashScreen(splash_pix, Qt.WindowStaysOnTopHint)
+                splash.setMask(splash_pix.mask())
+                splash.show()
+                app.processEvents()
 
         stylesheet_path = resource_path("styles.qss")
         if os.path.exists(stylesheet_path):
@@ -131,10 +135,17 @@ def main():
             """)
 
         window = MainWindow()
-        window.show()
+        if is_edge_mode:
+            # Edge runtime should only show live camera feed window.
+            window.hide()
+        else:
+            window.show()
 
         if 'splash' in locals():
-            splash.finish(window)
+            if not is_edge_mode:
+                splash.finish(window)
+            else:
+                splash.close()
 
         sys.exit(app.exec())
     

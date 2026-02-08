@@ -290,6 +290,100 @@ class EdgeDeviceManager:
                 except OSError:
                     pass
 
+    def stop_runtime(
+        self,
+        ip,
+        username,
+        password,
+        remote_dir="~/smart_mirror_edge",
+        progress_callback=None,
+    ):
+        username = (username or "").strip()
+        password = (password or "").strip()
+        if not username:
+            return EdgeDeployResult(False, "Username is required to stop edge runtime.")
+        if not password:
+            return EdgeDeployResult(False, "Password is required to stop edge runtime.")
+
+        remote_dir = self._normalize_remote_dir((remote_dir or "~/smart_mirror_edge").strip())
+        paramiko = self._get_paramiko()
+        if paramiko is None:
+            return EdgeDeployResult(
+                False,
+                "Missing dependency: paramiko. Install it with 'pip install paramiko'.",
+            )
+
+        client = None
+        try:
+            self._emit_progress(progress_callback, f"[edge:{ip}] Connecting over SSH for stop...")
+            client = self._connect_client(paramiko, ip, username, password, timeout=8)
+            escaped_remote_dir = self._remote_path_expr(remote_dir)
+
+            stop_script = (
+                "set +e; "
+                f"cd {escaped_remote_dir} 2>/dev/null || true; "
+                "RUNTIME_PID=''; "
+                "if [ -f edge_app.pid ]; then "
+                "RUNTIME_PID=$(cat edge_app.pid 2>/dev/null || true); "
+                "fi; "
+                "if [ -n \"$RUNTIME_PID\" ] && kill -0 \"$RUNTIME_PID\" 2>/dev/null; then "
+                "kill \"$RUNTIME_PID\" 2>/dev/null || true; "
+                "sleep 1; "
+                "if kill -0 \"$RUNTIME_PID\" 2>/dev/null; then "
+                "kill -9 \"$RUNTIME_PID\" 2>/dev/null || true; "
+                "fi; "
+                "fi; "
+                "if [ -n \"$RUNTIME_PID\" ] && kill -0 \"$RUNTIME_PID\" 2>/dev/null; then "
+                "echo \"Failed to stop runtime PID $RUNTIME_PID\"; "
+                "exit 1; "
+                "fi; "
+                "rm -f edge_app.pid 2>/dev/null || true; "
+                "if [ -n \"$RUNTIME_PID\" ]; then "
+                "echo \"Stopped runtime PID $RUNTIME_PID\"; "
+                "else "
+                "echo \"No active runtime PID found.\"; "
+                "fi; "
+                "exit 0"
+            )
+
+            exit_code, stdout, stderr = self._exec_remote(
+                client,
+                f"bash -lc {shlex.quote(stop_script)}",
+                timeout=90,
+            )
+            if exit_code != 0:
+                details = (stderr or stdout).strip()
+                self._emit_progress(progress_callback, f"[edge:{ip}] Runtime stop failed.")
+                return EdgeDeployResult(
+                    False,
+                    f"Failed to stop edge runtime on {ip}.",
+                    details,
+                )
+
+            details = stdout.strip()
+            self._emit_progress(progress_callback, f"[edge:{ip}] Runtime stop completed.")
+            if details:
+                for line in details.splitlines():
+                    self._emit_progress(progress_callback, f"[edge:{ip}] {line}")
+            return EdgeDeployResult(
+                True,
+                f"Edge runtime stop command completed for {ip}.",
+                details,
+            )
+        except Exception as exc:
+            self._emit_progress(progress_callback, f"[edge:{ip}] Stop error: {exc}")
+            return EdgeDeployResult(
+                False,
+                f"Edge stop failed for {ip}.",
+                str(exc),
+            )
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
     def _collect_candidate_networks(self):
         candidates = []
         interfaces = psutil.net_if_addrs()

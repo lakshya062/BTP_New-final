@@ -87,6 +87,48 @@ class EdgeDeployWorker(QThread):
 
         self.finished_signal.emit({"success_ips": success_ips, "failures": failures})
 
+
+class EdgeStopWorker(QThread):
+    progress_signal = Signal(str)
+    finished_signal = Signal(object)
+
+    def __init__(self, edge_device_manager, edge_devices, parent=None):
+        super().__init__(parent)
+        self.edge_device_manager = edge_device_manager
+        self.edge_devices = edge_devices
+
+    def run(self):
+        success_ips = []
+        failures = []
+        for edge in self.edge_devices:
+            if self.isInterruptionRequested():
+                break
+            ip = (edge.get("ip") or "").strip()
+            username = (edge.get("username") or "").strip()
+            password = (edge.get("password") or "").strip()
+            remote_dir = (edge.get("remote_dir") or "~/smart_mirror_edge").strip()
+            if not ip:
+                continue
+
+            self.progress_signal.emit(f"Stopping edge runtime on {ip}...")
+            result = self.edge_device_manager.stop_runtime(
+                ip=ip,
+                username=username,
+                password=password,
+                remote_dir=remote_dir,
+                progress_callback=self.progress_signal.emit,
+            )
+            if result.success:
+                success_ips.append(ip)
+                self.progress_signal.emit(f"Edge runtime stop successful for {ip}.")
+            else:
+                details = f" ({result.details})" if result.details else ""
+                failures.append(f"{ip}: {result.message}{details}")
+                self.progress_signal.emit(f"Edge runtime stop failed for {ip}.")
+
+        self.finished_signal.emit({"success_ips": success_ips, "failures": failures})
+
+
 class SmartMirrorWindow(QMainWindow):
     """
     Window for the HDMI smart mirror display. Frames are centered on a styled
@@ -311,6 +353,10 @@ class MainWindow(QMainWindow):
         self.delete_exercise_button.setToolTip("Delete the selected exercise")
         self.start_all_button = QPushButton(QIcon(resource_path("icons", "start.png")), "Start All")
         self.start_all_button.setToolTip("Start all exercises")
+        self.stop_edge_button = QPushButton(QIcon(resource_path("icons", "stop.png")), "Stop")
+        self.stop_edge_button.setToolTip("Stop runtime on a selected edge device")
+        self.stop_all_edge_button = QPushButton(QIcon(resource_path("icons", "stop.png")), "Stop All")
+        self.stop_all_edge_button.setToolTip("Stop runtime on all edge devices")
         self.layout_selector = QComboBox()
         self.layout_selector.addItems(["2 Screens", "4 Screens", "8 Screens", "16 Screens"])
         self.layout_selector.setCurrentIndex(1)
@@ -320,6 +366,8 @@ class MainWindow(QMainWindow):
         self.controls_layout.addWidget(self.add_exercise_button)
         self.controls_layout.addWidget(self.delete_exercise_button)
         self.controls_layout.addWidget(self.start_all_button)
+        self.controls_layout.addWidget(self.stop_edge_button)
+        self.controls_layout.addWidget(self.stop_all_edge_button)
         self.controls_layout.addWidget(QLabel("Set Layout:"))
         self.controls_layout.addWidget(self.layout_selector)
         self.controls_layout.addStretch()
@@ -330,6 +378,8 @@ class MainWindow(QMainWindow):
         self.add_exercise_button.clicked.connect(self.add_exercise_dialog)
         self.delete_exercise_button.clicked.connect(self.delete_current_exercise)
         self.start_all_button.clicked.connect(self.start_all_exercises)
+        self.stop_edge_button.clicked.connect(self.stop_selected_edge_runtime)
+        self.stop_all_edge_button.clicked.connect(self.stop_all_edge_runtimes)
         self.layout_selector.currentIndexChanged.connect(self.change_camera_layout)
 
         self.status_bar = QStatusBar()
@@ -341,6 +391,7 @@ class MainWindow(QMainWindow):
         self.edge_device_manager = EdgeDeviceManager(project_path())
         self.edge_devices = []
         self._edge_deploy_worker = None
+        self._edge_stop_worker = None
         self.is_edge_mode = os.environ.get("SMART_MIRROR_EDGE_MODE", "0") == "1"
         self.edge_allow_close = os.environ.get("SMART_MIRROR_EDGE_ALLOW_CLOSE", "0") == "1"
         self._is_shutting_down = False
@@ -352,6 +403,10 @@ class MainWindow(QMainWindow):
         if self.is_edge_mode:
             self.add_device_button.setEnabled(False)
             self.add_device_button.setVisible(False)
+            self.stop_edge_button.setEnabled(False)
+            self.stop_edge_button.setVisible(False)
+            self.stop_all_edge_button.setEnabled(False)
+            self.stop_all_edge_button.setVisible(False)
             if os.environ.get("SMART_MIRROR_EDGE_AUTOSTART", "0") == "1":
                 QTimer.singleShot(1800, self.start_all_exercises)
 
@@ -580,6 +635,13 @@ class MainWindow(QMainWindow):
     def _start_edge_deployments(self):
         if self.is_edge_mode:
             return True
+        if self._edge_stop_worker and self._edge_stop_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Edge Runtime",
+                "Edge stop operation is currently running.",
+            )
+            return False
         if self._edge_deploy_worker and self._edge_deploy_worker.isRunning():
             QMessageBox.information(
                 self,
@@ -592,6 +654,8 @@ class MainWindow(QMainWindow):
             return True
 
         self.start_all_button.setEnabled(False)
+        self.stop_edge_button.setEnabled(False)
+        self.stop_all_edge_button.setEnabled(False)
         self.status_bar.showMessage("Deploying edge devices over local network...")
 
         worker_payload = [dict(edge) for edge in self.edge_devices]
@@ -637,7 +701,139 @@ class MainWindow(QMainWindow):
             self._edge_deploy_worker.deleteLater()
             self._edge_deploy_worker = None
         self.start_all_button.setEnabled(True)
+        self.stop_edge_button.setEnabled(True)
+        self.stop_all_edge_button.setEnabled(True)
         self._start_local_exercises()
+
+    def _edge_choices(self):
+        choices = []
+        for edge in self.edge_devices:
+            ip = (edge.get("ip") or "").strip()
+            if not ip:
+                continue
+            hostname = (edge.get("hostname") or "unknown-host").strip()
+            label = f"{hostname} ({ip})"
+            choices.append((label, edge))
+        return choices
+
+    def stop_selected_edge_runtime(self):
+        if self.is_edge_mode:
+            return
+        if self._edge_deploy_worker and self._edge_deploy_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Edge Runtime",
+                "Wait for edge deployment to finish before stopping runtime.",
+            )
+            return
+        if self._edge_stop_worker and self._edge_stop_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Edge Runtime",
+                "Edge stop operation is already running.",
+            )
+            return
+
+        choices = self._edge_choices()
+        if not choices:
+            QMessageBox.information(self, "Edge Runtime", "No edge devices are configured.")
+            return
+
+        labels = [label for (label, _) in choices]
+        selected_label, ok = QInputDialog.getItem(
+            self,
+            "Stop Edge Runtime",
+            "Choose an edge device to stop:",
+            labels,
+            0,
+            False,
+        )
+        if not ok:
+            return
+
+        selected_devices = [dict(edge) for (label, edge) in choices if label == selected_label]
+        if not selected_devices:
+            return
+        self._start_edge_stop(selected_devices)
+
+    def stop_all_edge_runtimes(self):
+        if self.is_edge_mode:
+            return
+        if self._edge_deploy_worker and self._edge_deploy_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Edge Runtime",
+                "Wait for edge deployment to finish before stopping runtime.",
+            )
+            return
+        if self._edge_stop_worker and self._edge_stop_worker.isRunning():
+            QMessageBox.information(
+                self,
+                "Edge Runtime",
+                "Edge stop operation is already running.",
+            )
+            return
+        if not self.edge_devices:
+            QMessageBox.information(self, "Edge Runtime", "No edge devices are configured.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Stop All Edge Devices",
+            "Stop runtime on all configured edge devices?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._start_edge_stop([dict(edge) for edge in self.edge_devices if edge.get("ip")])
+
+    def _start_edge_stop(self, edge_payload):
+        if not edge_payload:
+            return
+
+        self.start_all_button.setEnabled(False)
+        self.stop_edge_button.setEnabled(False)
+        self.stop_all_edge_button.setEnabled(False)
+        self.status_bar.showMessage("Stopping edge runtime...")
+
+        self._edge_stop_worker = EdgeStopWorker(
+            self.edge_device_manager,
+            edge_payload,
+            self,
+        )
+        self._edge_stop_worker.progress_signal.connect(self.update_status)
+        self._edge_stop_worker.finished_signal.connect(self._on_edge_stop_finished)
+        self._edge_stop_worker.start()
+
+    @Slot(object)
+    def _on_edge_stop_finished(self, payload):
+        success_ips = payload.get("success_ips", [])
+        failures = payload.get("failures", [])
+
+        if failures:
+            QMessageBox.warning(
+                self,
+                "Edge Runtime Stop",
+                "Some edge devices failed to stop:\n\n" + "\n".join(failures),
+            )
+            self.status_bar.showMessage(
+                f"Stopped {len(success_ips)} edge device(s); {len(failures)} failed.",
+                10000,
+            )
+        else:
+            self.status_bar.showMessage(
+                f"Stopped {len(success_ips)} edge device(s).",
+                8000,
+            )
+
+        if self._edge_stop_worker:
+            self._edge_stop_worker.deleteLater()
+            self._edge_stop_worker = None
+        self.start_all_button.setEnabled(True)
+        self.stop_edge_button.setEnabled(True)
+        self.stop_all_edge_button.setEnabled(True)
 
     def add_member_dialog(self):
         dialog = AddMemberDialog(self.db_handler, self)
@@ -839,7 +1035,11 @@ class MainWindow(QMainWindow):
             for (ci, ex) in missing:
                 msg += f"cam_{ci} for exercise {ex.replace('_', ' ').title()}\n"
             msg += "The remaining cameras will be started."
-            QMessageBox.warning(self, "Missing Cameras", msg)
+            if self.is_edge_mode:
+                logging.warning(msg)
+                self.status_bar.showMessage(msg, 8000)
+            else:
+                QMessageBox.warning(self, "Missing Cameras", msg)
 
         started_any = False
         for (page, cam_idx, ex, _) in self.exercise_pages:
@@ -851,13 +1051,15 @@ class MainWindow(QMainWindow):
         if started_any:
             if self.smart_mirror_window is None:
                 screens = QGuiApplication.screens()
-                if len(screens) > 1:
+                if screens:
                     self.smart_mirror_window = SmartMirrorWindow()
                     self.smart_mirror_window.set_displays(screens)
                     for (p, ci, exx, _) in self.exercise_pages:
                         if p.is_exercise_running():
                             self.smart_mirror_window.add_camera_display(ci, exx)
                             self._connect_mirror_feed(p, ci, exx)
+                else:
+                    logging.warning("No display detected for camera feed window.")
             else:
                 for (p, ci, exx, _) in self.exercise_pages:
                     if p.is_exercise_running():
@@ -866,6 +1068,8 @@ class MainWindow(QMainWindow):
 
             if self.smart_mirror_window and not self.smart_mirror_window.isVisible():
                 self.smart_mirror_window.show()
+            if self.is_edge_mode:
+                self.hide()
 
         self.update_overview_tab()
 
@@ -923,6 +1127,9 @@ class MainWindow(QMainWindow):
         if self._edge_deploy_worker and self._edge_deploy_worker.isRunning():
             self._edge_deploy_worker.requestInterruption()
             self._edge_deploy_worker.wait(3000)
+        if self._edge_stop_worker and self._edge_stop_worker.isRunning():
+            self._edge_stop_worker.requestInterruption()
+            self._edge_stop_worker.wait(3000)
 
         for (page, _, _, _) in self.exercise_pages[:]:
             self._disconnect_mirror_feed(page)
