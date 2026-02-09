@@ -1,5 +1,6 @@
 import getpass
 import ipaddress
+import json
 import logging
 import os
 import shlex
@@ -108,6 +109,16 @@ class EdgeDeviceManager:
         remote_dir="~/smart_mirror_edge",
         display=":0",
         install_deps=False,
+        setup_postgres=True,
+        db_backend="postgres",
+        pg_db="gym_edge_db",
+        pg_user="",
+        pg_password="admin",
+        pg_host="localhost",
+        pg_port="5432",
+        mirror_id="",
+        gym_id="",
+        main_system_id="",
         progress_callback=None,
     ):
         username = (username or "").strip()
@@ -119,6 +130,24 @@ class EdgeDeviceManager:
 
         remote_dir = self._normalize_remote_dir((remote_dir or "~/smart_mirror_edge").strip())
         display = (display or ":0").strip()
+        db_backend = "postgres"
+        setup_postgres_flag = "1"
+        escaped_pg_db = shlex.quote(str(pg_db or "gym_edge_db"))
+        default_pg_user = (
+            username
+            or os.getenv("SMART_MIRROR_DEFAULT_PG_USER", os.getenv("PGUSER", "")).strip()
+        )
+        escaped_pg_user = shlex.quote(str(pg_user or default_pg_user))
+        escaped_pg_password = shlex.quote(
+            str(pg_password or os.getenv("SMART_MIRROR_DEFAULT_PG_PASSWORD", "admin") or "admin")
+        )
+        escaped_pg_host = shlex.quote(str(pg_host or "localhost"))
+        escaped_pg_port = shlex.quote(str(pg_port or "5432"))
+        escaped_db_backend = shlex.quote(db_backend)
+        escaped_sudo_password = shlex.quote(str(password or ""))
+        escaped_mirror_id = shlex.quote(str(mirror_id or ""))
+        escaped_gym_id = shlex.quote(str(gym_id or ""))
+        escaped_main_system_id = shlex.quote(str(main_system_id or ""))
 
         paramiko = self._get_paramiko()
         if paramiko is None:
@@ -155,6 +184,15 @@ class EdgeDeviceManager:
                 f"exec >> \"$DEPLOY_LOG\" 2>&1; "
                 f"echo \"==== $(date) :: deploy start ====\"; "
                 f"mkdir -p {escaped_remote_dir}; "
+                f"cd {escaped_remote_dir}; "
+                # Always refresh code to latest: remove stale files that may survive extraction.
+                # Keep local runtime state files so face model/member DB and venv are not lost.
+                f"find . -mindepth 1 -maxdepth 1 "
+                f"! -name '.venv' "
+                f"! -name 'trained_model.hdf5' "
+                f"! -name '.edge_deps.hash' "
+                f"! -name 'edge_app.pid' "
+                f"-exec rm -rf {{}} +; "
                 f"tar -xzf {escaped_remote_bundle} -C {escaped_remote_dir}; "
                 f"rm -f {escaped_remote_bundle}; "
                 f"cd {escaped_remote_dir}; "
@@ -178,6 +216,20 @@ class EdgeDeviceManager:
                 f"pip install -r \"$REQ_FILE\"; "
                 f"echo \"$REQ_HASH\" > .edge_deps.hash; "
                 f"fi; "
+                f"if [ '{setup_postgres_flag}' = '1' ] && [ -f 'scripts/edge_setup_postgres.sh' ]; then "
+                f"SMART_MIRROR_PG_DB={escaped_pg_db} "
+                f"SMART_MIRROR_PG_USER={escaped_pg_user} "
+                f"SMART_MIRROR_PG_PASSWORD={escaped_pg_password} "
+                f"SMART_MIRROR_PG_HOST={escaped_pg_host} "
+                f"SMART_MIRROR_PG_PORT={escaped_pg_port} "
+                f"PGDATABASE={escaped_pg_db} "
+                f"PGUSER={escaped_pg_user} "
+                f"PGPASSWORD={escaped_pg_password} "
+                f"PGHOST={escaped_pg_host} "
+                f"PGPORT={escaped_pg_port} "
+                f"SMART_MIRROR_SUDO_PASSWORD={escaped_sudo_password} "
+                f"bash scripts/edge_setup_postgres.sh; "
+                f"fi; "
                 f"echo \"==== $(date) :: launching runtime ====\"; "
                 f"cd {escaped_remote_dir}; "
                 f"PY_BIN='python3'; "
@@ -194,6 +246,21 @@ class EdgeDeviceManager:
                 f"set +e; "
                 f"nohup env DISPLAY={escaped_display} QT_QPA_PLATFORM=xcb "
                 f"SMART_MIRROR_EDGE_MODE=1 SMART_MIRROR_EDGE_AUTOSTART=1 SMART_MIRROR_DISABLE_ARUCO=1 "
+                f"SMART_MIRROR_DB_BACKEND={escaped_db_backend} "
+                f"SMART_MIRROR_PG_DB={escaped_pg_db} "
+                f"SMART_MIRROR_PG_USER={escaped_pg_user} "
+                f"SMART_MIRROR_PG_PASSWORD={escaped_pg_password} "
+                f"SMART_MIRROR_PG_HOST={escaped_pg_host} "
+                f"SMART_MIRROR_PG_PORT={escaped_pg_port} "
+                f"PGDATABASE={escaped_pg_db} "
+                f"PGUSER={escaped_pg_user} "
+                f"PGPASSWORD={escaped_pg_password} "
+                f"PGHOST={escaped_pg_host} "
+                f"PGPORT={escaped_pg_port} "
+                f"SMART_MIRROR_MIRROR_ID={escaped_mirror_id} "
+                f"SMART_MIRROR_GYM_ID={escaped_gym_id} "
+                f"SMART_MIRROR_MAIN_SYSTEM_ID={escaped_main_system_id} "
+                f"SMART_MIRROR_NODE_ROLE=EDGE "
                 f"PYTHONFAULTHANDLER=1 PYTHONUNBUFFERED=1 "
                 f"$PY_BIN app.py >> \"$RUNTIME_LOG\" 2>&1 < /dev/null & "
                 f"LAUNCH_STATUS=$?; "
@@ -384,6 +451,190 @@ class EdgeDeviceManager:
                 except Exception:
                     pass
 
+    def fetch_pending_exercise_data(
+        self,
+        ip,
+        username,
+        password,
+        remote_dir="~/smart_mirror_edge",
+        limit=500,
+        db_backend="postgres",
+        pg_db="gym_edge_db",
+        pg_user="",
+        pg_password="admin",
+        pg_host="localhost",
+        pg_port="5432",
+        progress_callback=None,
+    ):
+        username = (username or "").strip()
+        password = (password or "").strip()
+        if not username:
+            return False, [], "Username is required to pull edge data."
+        if not password:
+            return False, [], "Password is required to pull edge data."
+
+        paramiko = self._get_paramiko()
+        if paramiko is None:
+            return False, [], "Missing dependency: paramiko."
+
+        remote_dir = self._normalize_remote_dir((remote_dir or "~/smart_mirror_edge").strip())
+        escaped_remote_dir = self._remote_path_expr(remote_dir)
+        limit = max(1, int(limit))
+        escaped_db_backend = shlex.quote("postgres")
+        escaped_pg_db = shlex.quote(str(pg_db or "gym_edge_db"))
+        default_pg_user = (
+            username
+            or os.getenv("SMART_MIRROR_DEFAULT_PG_USER", os.getenv("PGUSER", "")).strip()
+        )
+        escaped_pg_user = shlex.quote(str(pg_user or default_pg_user))
+        escaped_pg_password = shlex.quote(
+            str(pg_password or os.getenv("SMART_MIRROR_DEFAULT_PG_PASSWORD", "admin") or "admin")
+        )
+        escaped_pg_host = shlex.quote(str(pg_host or "localhost"))
+        escaped_pg_port = shlex.quote(str(pg_port or "5432"))
+
+        client = None
+        try:
+            self._emit_progress(progress_callback, f"[edge:{ip}] Pulling pending exercise data...")
+            client = self._connect_client(paramiko, ip, username, password, timeout=8)
+            command = (
+                f"cd {escaped_remote_dir}; "
+                f"PY_BIN='python3'; "
+                f"if [ -x '.venv/bin/python' ]; then PY_BIN='.venv/bin/python'; fi; "
+                f"SMART_MIRROR_DB_BACKEND={escaped_db_backend} "
+                f"SMART_MIRROR_PG_DB={escaped_pg_db} "
+                f"SMART_MIRROR_PG_USER={escaped_pg_user} "
+                f"SMART_MIRROR_PG_PASSWORD={escaped_pg_password} "
+                f"SMART_MIRROR_PG_HOST={escaped_pg_host} "
+                f"SMART_MIRROR_PG_PORT={escaped_pg_port} "
+                f"PGDATABASE={escaped_pg_db} "
+                f"PGUSER={escaped_pg_user} "
+                f"PGPASSWORD={escaped_pg_password} "
+                f"PGHOST={escaped_pg_host} "
+                f"PGPORT={escaped_pg_port} "
+                f"PYTHONPATH=\"$PWD:${{PYTHONPATH:-}}\" "
+                f"$PY_BIN scripts/edge_export_pending.py --limit {limit} --mark-queued"
+            )
+            exit_code, stdout, stderr = self._exec_remote(
+                client,
+                f"bash -lc {shlex.quote(command)}",
+                timeout=90,
+            )
+            if exit_code != 0:
+                return False, [], (stderr or stdout).strip()
+
+            try:
+                payload = json.loads(stdout or "{}")
+            except json.JSONDecodeError as exc:
+                return False, [], f"Invalid edge export payload: {exc}"
+
+            records = payload.get("records") or []
+            self._emit_progress(
+                progress_callback,
+                f"[edge:{ip}] Pulled {len(records)} pending record(s).",
+            )
+            return True, records, ""
+        except Exception as exc:
+            return False, [], str(exc)
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    def mark_remote_records_synced(
+        self,
+        ip,
+        username,
+        password,
+        record_ids,
+        remote_dir="~/smart_mirror_edge",
+        status="SYNCED",
+        db_backend="postgres",
+        pg_db="gym_edge_db",
+        pg_user="",
+        pg_password="admin",
+        pg_host="localhost",
+        pg_port="5432",
+        progress_callback=None,
+    ):
+        clean_ids = [str(item).strip() for item in (record_ids or []) if str(item).strip()]
+        if not clean_ids:
+            return True, ""
+
+        username = (username or "").strip()
+        password = (password or "").strip()
+        if not username:
+            return False, "Username is required to mark edge records."
+        if not password:
+            return False, "Password is required to mark edge records."
+
+        paramiko = self._get_paramiko()
+        if paramiko is None:
+            return False, "Missing dependency: paramiko."
+
+        remote_dir = self._normalize_remote_dir((remote_dir or "~/smart_mirror_edge").strip())
+        escaped_remote_dir = self._remote_path_expr(remote_dir)
+        escaped_ids = shlex.quote(json.dumps(clean_ids))
+        escaped_status = shlex.quote((status or "SYNCED").upper())
+        escaped_db_backend = shlex.quote("postgres")
+        escaped_pg_db = shlex.quote(str(pg_db or "gym_edge_db"))
+        default_pg_user = (
+            username
+            or os.getenv("SMART_MIRROR_DEFAULT_PG_USER", os.getenv("PGUSER", "")).strip()
+        )
+        escaped_pg_user = shlex.quote(str(pg_user or default_pg_user))
+        escaped_pg_password = shlex.quote(
+            str(pg_password or os.getenv("SMART_MIRROR_DEFAULT_PG_PASSWORD", "admin") or "admin")
+        )
+        escaped_pg_host = shlex.quote(str(pg_host or "localhost"))
+        escaped_pg_port = shlex.quote(str(pg_port or "5432"))
+
+        client = None
+        try:
+            self._emit_progress(
+                progress_callback,
+                f"[edge:{ip}] Marking {len(clean_ids)} record(s) as {status}...",
+            )
+            client = self._connect_client(paramiko, ip, username, password, timeout=8)
+            command = (
+                f"cd {escaped_remote_dir}; "
+                f"PY_BIN='python3'; "
+                f"if [ -x '.venv/bin/python' ]; then PY_BIN='.venv/bin/python'; fi; "
+                f"SMART_MIRROR_DB_BACKEND={escaped_db_backend} "
+                f"SMART_MIRROR_PG_DB={escaped_pg_db} "
+                f"SMART_MIRROR_PG_USER={escaped_pg_user} "
+                f"SMART_MIRROR_PG_PASSWORD={escaped_pg_password} "
+                f"SMART_MIRROR_PG_HOST={escaped_pg_host} "
+                f"SMART_MIRROR_PG_PORT={escaped_pg_port} "
+                f"PGDATABASE={escaped_pg_db} "
+                f"PGUSER={escaped_pg_user} "
+                f"PGPASSWORD={escaped_pg_password} "
+                f"PGHOST={escaped_pg_host} "
+                f"PGPORT={escaped_pg_port} "
+                f"PYTHONPATH=\"$PWD:${{PYTHONPATH:-}}\" "
+                f"$PY_BIN scripts/edge_mark_synced.py --ids {escaped_ids} --status {escaped_status}"
+            )
+            exit_code, stdout, stderr = self._exec_remote(
+                client,
+                f"bash -lc {shlex.quote(command)}",
+                timeout=60,
+            )
+            if exit_code != 0:
+                return False, (stderr or stdout).strip()
+
+            self._emit_progress(progress_callback, f"[edge:{ip}] Sync status update complete.")
+            return True, stdout.strip()
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
     def _collect_candidate_networks(self):
         candidates = []
         interfaces = psutil.net_if_addrs()
@@ -417,17 +668,22 @@ class EdgeDeviceManager:
         if not host_ips:
             return []
         open_hosts = []
+        scan_timeout = float(os.getenv("SMART_MIRROR_EDGE_SCAN_TIMEOUT_SEC", "0.8"))
+        scan_retries = max(1, int(os.getenv("SMART_MIRROR_EDGE_SCAN_RETRIES", "2")))
 
         def _has_ssh(ip_addr):
-            sock = None
-            try:
-                sock = socket.create_connection((ip_addr, 22), timeout=0.35)
-                return ip_addr
-            except OSError:
-                return None
-            finally:
-                if sock:
-                    sock.close()
+            for attempt in range(scan_retries):
+                sock = None
+                try:
+                    sock = socket.create_connection((ip_addr, 22), timeout=scan_timeout)
+                    return ip_addr
+                except OSError:
+                    if attempt < (scan_retries - 1):
+                        time.sleep(0.05)
+                finally:
+                    if sock:
+                        sock.close()
+            return None
 
         with ThreadPoolExecutor(max_workers=min(128, max(8, len(host_ips)))) as executor:
             futures = [executor.submit(_has_ssh, ip_addr) for ip_addr in host_ips]
@@ -480,7 +736,7 @@ class EdgeDeviceManager:
             "app.log",
             "worker.log",
             "network_utils.log",
-            "local_members.db",
+            "local_edge_buffer.db",
         }
 
         with tarfile.open(bundle_path, "w:gz") as tar:
@@ -489,7 +745,10 @@ class EdgeDeviceManager:
                 parts = set(rel_path.parts)
                 if parts & excluded_dirs:
                     continue
-                if path.is_file() and path.name in excluded_files:
+                if path.is_file() and (
+                    path.name in excluded_files
+                    or path.suffix in {".db", ".sqlite", ".sqlite3"}
+                ):
                     continue
                 tar.add(path, arcname=str(rel_path))
         return str(bundle_path)
@@ -528,18 +787,46 @@ class EdgeDeviceManager:
 
     @staticmethod
     def _connect_client(paramiko, ip, username, password, timeout=8):
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            ip,
-            username=username,
-            password=password,
-            timeout=timeout,
-            auth_timeout=timeout,
-            look_for_keys=False,
-            allow_agent=False,
-        )
-        return client
+        max_attempts = 2
+        last_exc = None
+        for attempt in range(max_attempts):
+            # Fast pre-check avoids expensive SSH handshakes when target port
+            # is unreachable and improves reliability on flaky Wi-Fi.
+            probe = None
+            try:
+                probe = socket.create_connection((ip, 22), timeout=timeout)
+            finally:
+                if probe is not None:
+                    try:
+                        probe.close()
+                    except Exception:
+                        pass
+
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                client.connect(
+                    ip,
+                    username=username,
+                    password=password,
+                    timeout=timeout,
+                    auth_timeout=timeout,
+                    banner_timeout=timeout,
+                    look_for_keys=False,
+                    allow_agent=False,
+                )
+                return client
+            except Exception as exc:
+                last_exc = exc
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                if attempt < (max_attempts - 1):
+                    time.sleep(0.2)
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"Unable to connect to {ip} over SSH.")
 
     @staticmethod
     def _get_paramiko():

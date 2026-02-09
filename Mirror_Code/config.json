@@ -1,5 +1,20 @@
 {
     "aruco_dict_type": "DICT_5X5_100",
+    "system": {
+        "gym_id": "36a67fbd-90e3-4aa2-886e-0a8b1b2bd996",
+        "main_system_id": "ac48af70-bc2b-43b6-8dad-db987b669276",
+        "node_role": "MAIN",
+        "mirror_id": "65e79f0e-8805-5098-b02a-8c9e258d9e73"
+    },
+    "server_sync": {
+        "enabled": true,
+        "server_url": "http://127.0.0.1:8000",
+        "ingest_endpoint": "/api/ingest/main-batch/",
+        "api_key": "local-test-key",
+        "gym_id": "36a67fbd-90e3-4aa2-886e-0a8b1b2bd996",
+        "main_system_id": "ac48af70-bc2b-43b6-8dad-db987b669276",
+        "timeout_seconds": 20.0
+    },
     "exercises": [
         {
             "camera_index": 0,
@@ -18,7 +33,17 @@
             "remote_dir": "~/smart_mirror_edge",
             "display": ":1",
             "install_deps": false,
-            "last_deployed_at": "2026-02-08T10:18:27.008952"
+            "setup_postgres": true,
+            "db_backend": "postgres",
+            "pg_db": "gym_edge_db",
+            "pg_user": "lakshya",
+            "pg_password": "admin",
+            "pg_host": "localhost",
+            "pg_port": "5432",
+            "mirror_id": "cb8a8e05-14ef-418a-826e-6b617c5edc66",
+            "gym_id": "36a67fbd-90e3-4aa2-886e-0a8b1b2bd996",
+            "main_system_id": "ac48af70-bc2b-43b6-8dad-db987b669276",
+            "last_deployed_at": "2026-02-09T19:05:10.906316"
         }
     ]
 }

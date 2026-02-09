@@ -195,6 +195,85 @@ class BicepCurlFormGateTest(unittest.TestCase):
         self.assertEqual(analyzer.rep_state, 1)
         self.assertTrue(any("Warning:" in text for text in feedback))
 
+    def test_bicep_up_range_miss_overlay_flag_on_partial_rep(self):
+        landmarks = make_landmarks()
+        self.analyzer.stable_start_detected = True
+        self.analyzer.rep_state = 1
+        self.analyzer.side_pose_stable_frames = 12
+
+        down_form = {
+            "form_ok": True,
+            "front_facing": False,
+            "side_pose_detected": True,
+            "active_arm": "left",
+            "rep_angle": 160,
+            "active_wrist_shoulder_ratio": 0.72,
+            "top_position_ok": True,
+            "arm_metrics": {},
+        }
+        partial_up_form = {
+            "form_ok": True,
+            "front_facing": False,
+            "side_pose_detected": True,
+            "active_arm": "left",
+            "rep_angle": 132,
+            "active_wrist_shoulder_ratio": 0.66,
+            "top_position_ok": True,
+            "arm_metrics": {},
+        }
+
+        with patch.object(self.analyzer, "detect_bend", return_value=(False, None)):
+            with patch.object(
+                self.analyzer,
+                "_bicep_curl_form_gate",
+                side_effect=[down_form, partial_up_form, down_form],
+            ):
+                self.analyzer.analyze_exercise_form(landmarks, frame=None)
+                self.analyzer.analyze_exercise_form(landmarks, frame=None)
+                _, metrics = self.analyzer.analyze_exercise_form(landmarks, frame=None)
+
+        self.assertTrue(metrics.get("up_range_miss"))
+
+    def test_bicep_down_range_miss_overlay_flag_on_partial_return(self):
+        landmarks = make_landmarks()
+        self.analyzer.stable_start_detected = True
+        self.analyzer.rep_state = 2
+        self.analyzer.rep_active_arm = "left"
+        self.analyzer.side_pose_stable_frames = 12
+
+        up_form = {
+            "form_ok": True,
+            "front_facing": False,
+            "side_pose_detected": True,
+            "active_arm": "left",
+            "rep_angle": 45,
+            "active_wrist_shoulder_ratio": 0.52,
+            "top_position_ok": True,
+            "arm_metrics": {},
+        }
+        partial_down_form = {
+            "form_ok": True,
+            "front_facing": False,
+            "side_pose_detected": True,
+            "active_arm": "left",
+            "rep_angle": 98,
+            "active_wrist_shoulder_ratio": 0.62,
+            "top_position_ok": True,
+            "arm_metrics": {},
+        }
+
+        with patch.object(self.analyzer, "detect_bend", return_value=(False, None)):
+            with patch.object(
+                self.analyzer,
+                "_bicep_curl_form_gate",
+                side_effect=[up_form, partial_down_form, up_form],
+            ):
+                self.analyzer.analyze_exercise_form(landmarks, frame=None)
+                self.analyzer.analyze_exercise_form(landmarks, frame=None)
+                _, metrics = self.analyzer.analyze_exercise_form(landmarks, frame=None)
+
+        self.assertTrue(metrics.get("down_range_miss"))
+
 
 if __name__ == "__main__":
     unittest.main()

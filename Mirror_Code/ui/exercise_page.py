@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QPixmap, QImage, QFont, QIcon
 from PySide6.QtCore import Qt, Slot, Signal
 import numpy as np
+from ui.audio_feedback import AudioFeedbackPlayer
 from ui.worker import ExerciseWorker
 from core.paths import resource_path
 
@@ -87,6 +88,7 @@ class ExercisePage(QWidget):
         self.layout.addStretch()
 
         self.worker = None
+        self.audio_player = AudioFeedbackPlayer()
 
         self.start_button.clicked.connect(self.start_exercise)
         self.stop_button.clicked.connect(self.stop_exercise)
@@ -108,6 +110,7 @@ class ExercisePage(QWidget):
             self.worker.unknown_user_detected.connect(self.prompt_new_user_name)
             self.worker.new_user_registration_signal.connect(self.handle_new_user_registration_result)
             self.worker.data_updated.connect(self.on_data_updated)
+            self.worker.audio_feedback_signal.connect(self.play_audio_feedback)
             self.worker.started.connect(self.on_worker_started)
 
             self.worker.start()
@@ -126,6 +129,7 @@ class ExercisePage(QWidget):
                 self.worker.unknown_user_detected.disconnect(self.prompt_new_user_name)
                 self.worker.new_user_registration_signal.disconnect(self.handle_new_user_registration_result)
                 self.worker.data_updated.disconnect(self.on_data_updated)
+                self.worker.audio_feedback_signal.disconnect(self.play_audio_feedback)
                 self.worker.started.disconnect(self.on_worker_started)
             except TypeError as e:
                 self.status_message.emit(f"Error disconnecting signals: {e}")
@@ -133,6 +137,9 @@ class ExercisePage(QWidget):
             self.worker.request_stop()
             self.worker.wait()
             self.worker = None
+
+        if self.audio_player:
+            self.audio_player.clear_pending()
 
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -165,6 +172,22 @@ class ExercisePage(QWidget):
     @Slot(str)
     def emit_status_message(self, message):
         self.status_message.emit(message)
+
+    @Slot(str)
+    def play_audio_feedback(self, message):
+        if not self.audio_player:
+            return
+        normalized = str(message or "").strip()
+        if not normalized:
+            return
+        lowered = normalized.lower()
+        high_priority = (
+            "warning" in lowered
+            or "set" in lowered
+            or "go higher" in lowered
+            or "lower fully" in lowered
+        )
+        self.audio_player.enqueue(normalized, high_priority=high_priority)
 
     @Slot(int, int)
     def emit_counters_update(self, reps, sets):
@@ -199,4 +222,6 @@ class ExercisePage(QWidget):
 
     def closeEvent(self, event):
         self.stop_exercise()
+        if self.audio_player:
+            self.audio_player.stop()
         event.accept()

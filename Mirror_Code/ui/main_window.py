@@ -2,8 +2,11 @@
 
 import json
 import os
+import socket
 import sys
+import time
 import uuid
+import getpass
 from PySide6.QtWidgets import (
     QApplication, QMessageBox, QMainWindow, QWidget, QVBoxLayout, QTabWidget,
     QStatusBar, QPushButton, QHBoxLayout, QComboBox, QInputDialog, QDialog, QLabel, QSizePolicy
@@ -23,6 +26,7 @@ from core.aruco_detection import ArucoDetector
 from core.config import exercise_config
 from core.edge_device_manager import EdgeDeviceManager
 from core.paths import project_path, resource_path
+from core.server_sync import MainToServerSyncClient
 from ui.exercise_page import ExercisePage
 from ui.profile_page import ProfilePage
 from ui.member_list_page import MemberListPage
@@ -31,6 +35,40 @@ from ui.add_exercise_dialog import AddExerciseDialog
 from ui.add_device_dialog import AddDeviceDialog
 from ui.add_member_dialog import AddMemberDialog
 from ui.home_page import HomePage
+from ui.register_user_dialog import RegisterUserDialog
+
+
+def resolve_edge_pg_password(edge):
+    pg_password = (edge.get("pg_password") or "").strip()
+    if pg_password:
+        return pg_password
+    backend = (edge.get("db_backend") or "").strip().lower()
+    if backend == "postgres" or bool(edge.get("setup_postgres", False)):
+        configured_default = os.getenv("SMART_MIRROR_DEFAULT_PG_PASSWORD", "admin").strip()
+        return configured_default or "admin"
+    return ""
+
+
+def resolve_edge_pg_user(edge):
+    configured = (edge.get("pg_user") or "").strip()
+    edge_username = (edge.get("username") or "").strip()
+    if configured:
+        local_defaults = {
+            getpass.getuser().strip(),
+            os.getenv("SMART_MIRROR_DEFAULT_PG_USER", "").strip(),
+            os.getenv("PGUSER", "").strip(),
+        }
+        local_defaults.discard("")
+        if edge_username and configured != edge_username and configured in local_defaults:
+            return edge_username
+        return configured
+    if edge_username:
+        return edge_username
+    default_user = os.getenv("SMART_MIRROR_DEFAULT_PG_USER", os.getenv("PGUSER", "")).strip()
+    if default_user:
+        return default_user
+    return getpass.getuser()
+
 
 def detect_available_cameras(max_cameras=10):
     available_cams = []
@@ -75,6 +113,16 @@ class EdgeDeployWorker(QThread):
                 remote_dir=remote_dir,
                 display=display,
                 install_deps=install_deps,
+                setup_postgres=bool(edge.get("setup_postgres", False)),
+                db_backend=edge.get("db_backend", "postgres"),
+                pg_db=edge.get("pg_db", "gym_edge_db"),
+                pg_user=resolve_edge_pg_user(edge),
+                pg_password=resolve_edge_pg_password(edge),
+                pg_host=edge.get("pg_host", "localhost"),
+                pg_port=edge.get("pg_port", "5432"),
+                mirror_id=edge.get("mirror_id", ""),
+                gym_id=edge.get("gym_id", ""),
+                main_system_id=edge.get("main_system_id", ""),
                 progress_callback=self.progress_signal.emit,
             )
             if result.success:
@@ -309,6 +357,31 @@ class MainWindow(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
+        pg_default_user = os.getenv(
+            "SMART_MIRROR_DEFAULT_PG_USER",
+            os.getenv("PGUSER", getpass.getuser()),
+        )
+        pg_default_password = os.getenv("SMART_MIRROR_DEFAULT_PG_PASSWORD", "admin")
+        runtime_edge_mode = os.environ.get("SMART_MIRROR_EDGE_MODE", "0") == "1"
+        if runtime_edge_mode:
+            os.environ.setdefault("SMART_MIRROR_DB_BACKEND", "postgres")
+            os.environ.setdefault("SMART_MIRROR_NODE_ROLE", "EDGE")
+            os.environ.setdefault("SMART_MIRROR_PG_DB", "gym_edge_db")
+            os.environ.setdefault("SMART_MIRROR_PG_USER", pg_default_user)
+            os.environ.setdefault("SMART_MIRROR_PG_PASSWORD", pg_default_password)
+            os.environ.setdefault("SMART_MIRROR_PG_HOST", "localhost")
+            os.environ.setdefault("SMART_MIRROR_PG_PORT", "5432")
+            os.environ.setdefault("SMART_MIRROR_LOCAL_CAMERA_AS_EDGE", "0")
+        else:
+            os.environ.setdefault("SMART_MIRROR_DB_BACKEND", "postgres")
+            os.environ.setdefault("SMART_MIRROR_NODE_ROLE", "MAIN")
+            os.environ.setdefault("SMART_MIRROR_PG_DB", "gym_main_db")
+            os.environ.setdefault("SMART_MIRROR_PG_USER", pg_default_user)
+            os.environ.setdefault("SMART_MIRROR_PG_PASSWORD", pg_default_password)
+            os.environ.setdefault("SMART_MIRROR_PG_HOST", "localhost")
+            os.environ.setdefault("SMART_MIRROR_PG_PORT", "5432")
+            os.environ.setdefault("SMART_MIRROR_LOCAL_CAMERA_AS_EDGE", "0")
+
         self.db_handler = DatabaseHandler()
         self.global_face_recognizer = FaceRecognizer()
         if not self.global_face_recognizer.known_face_encodings:
@@ -396,9 +469,55 @@ class MainWindow(QMainWindow):
         self.edge_allow_close = os.environ.get("SMART_MIRROR_EDGE_ALLOW_CLOSE", "0") == "1"
         self._is_shutting_down = False
         self.aruco_dict_type = "DICT_5X5_100"
+        self.system_config = {
+            "gym_id": "",
+            "main_system_id": "",
+            "node_role": "EDGE" if self.is_edge_mode else "MAIN",
+            "mirror_id": os.getenv("SMART_MIRROR_MIRROR_ID", ""),
+        }
+        self.server_sync_config = {
+            "enabled": not self.is_edge_mode,
+            "server_url": "http://127.0.0.1:8000",
+            "ingest_endpoint": "/api/ingest/main-batch/",
+            "api_key": "local-test-key",
+            "gym_id": "",
+            "main_system_id": "",
+            "timeout_seconds": 20,
+        }
+        self._last_sync_transfer_at = 0.0
+        self._sync_transfer_min_gap_sec = 15.0
+        self._pending_registration_profiles = {}
+        self.local_camera_as_edge = False
         self.load_config()
+        if (self.system_config.get("node_role") or "MAIN").upper() == "MAIN":
+            if not self.system_config.get("gym_id"):
+                self.system_config["gym_id"] = str(uuid.uuid4())
+            if not self.system_config.get("main_system_id"):
+                self.system_config["main_system_id"] = str(uuid.uuid4())
+            self.server_sync_config["gym_id"] = self.server_sync_config.get("gym_id") or self.system_config["gym_id"]
+            self.server_sync_config["main_system_id"] = self.server_sync_config.get("main_system_id") or self.system_config["main_system_id"]
+            auto_pipeline = os.getenv("SMART_GYM_AUTOMATIC_PIPELINE", "1") == "1"
+            if auto_pipeline:
+                self.server_sync_config["enabled"] = True
+            else:
+                self.server_sync_config["enabled"] = bool(self.server_sync_config.get("enabled", True))
+        if not self.system_config.get("mirror_id"):
+            self.system_config["mirror_id"] = str(uuid.uuid4())
+        os.environ["SMART_MIRROR_NODE_ROLE"] = self.system_config.get("node_role", "MAIN")
+        if self.system_config.get("gym_id"):
+            os.environ["SMART_MIRROR_GYM_ID"] = self.system_config["gym_id"]
+        if self.system_config.get("main_system_id"):
+            os.environ["SMART_MIRROR_MAIN_SYSTEM_ID"] = self.system_config["main_system_id"]
+        if self.system_config.get("mirror_id"):
+            os.environ["SMART_MIRROR_MIRROR_ID"] = self.system_config["mirror_id"]
+        self.local_camera_as_edge = (
+            (self.system_config.get("node_role") or "MAIN").upper() == "MAIN"
+            and os.getenv("SMART_MIRROR_LOCAL_CAMERA_AS_EDGE", "0") == "1"
+        )
+        self.server_sync_client = MainToServerSyncClient(self.db_handler, self.server_sync_config)
         self._ensure_edge_default_exercise()
         self.update_overview_tab()
+        self.save_config()
 
         if self.is_edge_mode:
             self.add_device_button.setEnabled(False)
@@ -411,7 +530,7 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(1800, self.start_all_exercises)
 
         self.sync_timer = QTimer(self)
-        self.sync_timer.timeout.connect(self.sync_local_data_to_sqlite)
+        self.sync_timer.timeout.connect(lambda: self.sync_local_data_to_postgres(force_transfer=False))
         self.sync_timer.start(60000)
 
     def sync_face_model_with_db(self):
@@ -490,8 +609,48 @@ class MainWindow(QMainWindow):
         if os.path.exists(self.CONFIG_FILE):
             with open(self.CONFIG_FILE, "r") as f:
                 data = json.load(f)
+            self.system_config = {
+                "gym_id": data.get("system", {}).get("gym_id", ""),
+                "main_system_id": data.get("system", {}).get("main_system_id", ""),
+                "node_role": data.get("system", {}).get(
+                    "node_role",
+                    "EDGE" if self.is_edge_mode else "MAIN",
+                ),
+                "mirror_id": data.get("system", {}).get(
+                    "mirror_id",
+                    os.getenv("SMART_MIRROR_MIRROR_ID", ""),
+                ),
+            }
+            self.server_sync_config = {
+                "enabled": bool(data.get("server_sync", {}).get("enabled", True)),
+                "server_url": data.get("server_sync", {}).get("server_url", "http://127.0.0.1:8000"),
+                "ingest_endpoint": data.get("server_sync", {}).get(
+                    "ingest_endpoint",
+                    "/api/ingest/main-batch/",
+                ),
+                "api_key": data.get("server_sync", {}).get("api_key", "local-test-key"),
+                "gym_id": data.get("server_sync", {}).get(
+                    "gym_id",
+                    data.get("system", {}).get("gym_id", ""),
+                ),
+                "main_system_id": data.get("server_sync", {}).get(
+                    "main_system_id",
+                    data.get("system", {}).get("main_system_id", ""),
+                ),
+                "timeout_seconds": float(data.get("server_sync", {}).get("timeout_seconds", 20)),
+            }
             self.edge_devices = []
             for item in data.get("devices", []):
+                cfg_username = item.get("username", "")
+                cfg_pg_user = (item.get("pg_user") or "").strip()
+                if not cfg_pg_user:
+                    cfg_pg_user = (
+                        cfg_username
+                        or os.getenv("SMART_MIRROR_DEFAULT_PG_USER", os.getenv("PGUSER", "")).strip()
+                        or getpass.getuser()
+                    )
+                if not cfg_pg_user:
+                    cfg_pg_user = getpass.getuser()
                 self.edge_devices.append(
                     {
                         "ip": item.get("ip", ""),
@@ -503,6 +662,22 @@ class MainWindow(QMainWindow):
                         "remote_dir": item.get("remote_dir", "~/smart_mirror_edge"),
                         "display": item.get("display", ":0"),
                         "install_deps": bool(item.get("install_deps", False)),
+                        "setup_postgres": bool(item.get("setup_postgres", True)),
+                        "db_backend": item.get("db_backend", "postgres"),
+                        "pg_db": item.get("pg_db", "gym_edge_db"),
+                        "pg_user": cfg_pg_user,
+                        "pg_password": item.get("pg_password") or "admin",
+                        "pg_host": item.get("pg_host", "localhost"),
+                        "pg_port": item.get("pg_port", "5432"),
+                        "mirror_id": item.get("mirror_id", ""),
+                        "gym_id": item.get(
+                            "gym_id",
+                            data.get("system", {}).get("gym_id", ""),
+                        ),
+                        "main_system_id": item.get(
+                            "main_system_id",
+                            data.get("system", {}).get("main_system_id", ""),
+                        ),
                         "last_deployed_at": item.get("last_deployed_at", ""),
                     }
                 )
@@ -524,7 +699,13 @@ class MainWindow(QMainWindow):
         else:
             with open(self.CONFIG_FILE, "w") as f:
                 json.dump(
-                    {"aruco_dict_type": self.aruco_dict_type, "exercises": [], "devices": []},
+                    {
+                        "aruco_dict_type": self.aruco_dict_type,
+                        "system": self.system_config,
+                        "server_sync": self.server_sync_config,
+                        "exercises": [],
+                        "devices": [],
+                    },
                     f,
                     indent=4,
                 )
@@ -535,6 +716,8 @@ class MainWindow(QMainWindow):
             exercises.append({"camera_index": cam_idx, "exercise": ex, "user_name": user})
         data = {
             "aruco_dict_type": self.aruco_dict_type,
+            "system": self.system_config,
+            "server_sync": self.server_sync_config,
             "exercises": exercises,
             "devices": self.edge_devices,
         }
@@ -590,6 +773,7 @@ class MainWindow(QMainWindow):
         remote_dir = selection["remote_dir"]
         display = selection["display"]
         install_deps = selection["install_deps"]
+        setup_postgres = True
 
         if not device.ip:
             QMessageBox.warning(self, "Add Device", "No edge device selected.")
@@ -602,18 +786,51 @@ class MainWindow(QMainWindow):
             remote_dir=remote_dir,
             display=display,
             install_deps=install_deps,
+            setup_postgres=setup_postgres,
         )
         self.save_config()
         message = (
             f"Edge device added.\n\n"
             f"Host: {device.hostname or 'unknown'}\n"
             f"IP: {device.ip}\n"
+            f"Edge DB mode: postgres\n"
             f"Code deploy/start will run automatically on Start All."
         )
         self.status_bar.showMessage(f"Edge device {device.ip} added.", 8000)
         QMessageBox.information(self, "Add Device", message)
 
-    def _upsert_edge_device(self, device, username, password, remote_dir, display, install_deps):
+    def _upsert_edge_device(
+        self,
+        device,
+        username,
+        password,
+        remote_dir,
+        display,
+        install_deps,
+        setup_postgres=False,
+    ):
+        setup_postgres = True
+        existing_record = None
+        mirror_id = ""
+        for existing in self.edge_devices:
+            if existing.get("ip") == device.ip:
+                existing_record = existing
+                mirror_id = existing.get("mirror_id", "")
+                break
+        if not mirror_id:
+            mirror_id = str(uuid.uuid4())
+
+        existing_pg_password = ""
+        if existing_record is not None:
+            existing_pg_password = (existing_record.get("pg_password") or "").strip()
+        default_pg_user = (
+            (username or "").strip()
+            or os.getenv("SMART_MIRROR_DEFAULT_PG_USER", os.getenv("PGUSER", "")).strip()
+            or getpass.getuser()
+        )
+        # Keep pg_password optional in config; runtime falls back to admin default.
+        effective_pg_password = existing_pg_password or "admin"
+
         record = {
             "ip": device.ip,
             "hostname": device.hostname,
@@ -624,6 +841,16 @@ class MainWindow(QMainWindow):
             "remote_dir": remote_dir,
             "display": display,
             "install_deps": bool(install_deps),
+            "setup_postgres": True,
+            "db_backend": "postgres",
+            "pg_db": "gym_edge_db",
+            "pg_user": default_pg_user,
+            "pg_password": effective_pg_password,
+            "pg_host": "localhost",
+            "pg_port": "5432",
+            "mirror_id": mirror_id,
+            "gym_id": self.system_config.get("gym_id", ""),
+            "main_system_id": self.system_config.get("main_system_id", ""),
             "last_deployed_at": datetime.utcnow().isoformat(),
         }
         for idx, existing in enumerate(self.edge_devices):
@@ -919,8 +1146,12 @@ class MainWindow(QMainWindow):
     @Slot()
     def connect_data_updated_signal(self, exercise_page):
         if exercise_page.worker and not getattr(exercise_page.worker, "_data_updated_connected", False):
-            exercise_page.worker.data_updated.connect(self.sync_local_data_to_sqlite)
+            exercise_page.worker.data_updated.connect(self._on_worker_data_updated)
             exercise_page.worker._data_updated_connected = True
+
+    @Slot()
+    def _on_worker_data_updated(self):
+        self.sync_local_data_to_postgres(force_transfer=True)
 
     def prompt_new_user_name(self, exercise_page):
         if self.is_edge_mode:
@@ -932,38 +1163,52 @@ class MainWindow(QMainWindow):
             )
             return
 
-        username, ok = QInputDialog.getText(
-            self, "New User Registration", "Enter username for the new user:"
-        )
-        if ok and username.strip():
-            username = username.strip()
-            exercise_page.start_user_registration(username)
-            self.status_bar.showMessage(f"Capturing face data for user: {username}", 5000)
-        else:
+        dialog = RegisterUserDialog(self)
+        if dialog.exec() != QDialog.Accepted:
             self.status_bar.showMessage("User registration canceled.", 5000)
             QMessageBox.warning(self, "Registration Canceled", "User was not registered.")
+            return
+
+        member_info = dialog.get_member_info()
+        username = member_info["username"]
+
+        existing_member = self.db_handler.get_member_info(username)
+        if existing_member:
+            QMessageBox.warning(
+                self,
+                "Username Exists",
+                f"Username '{username}' already exists. Please choose another username.",
+            )
+            return
+
+        self._pending_registration_profiles[username] = member_info
+        exercise_page.start_user_registration(username)
+        self.status_bar.showMessage(
+            f"Capturing face data for user: {username}",
+            5000,
+        )
 
     @Slot(str, bool)
     def handle_new_user_registration_result(self, username, success):
+        pending_profile = self._pending_registration_profiles.pop(username, None)
         if not success:
             self.status_bar.showMessage(f"Failed to register user: {username}", 5000)
             QMessageBox.warning(self, "Registration Failed", f"Could not register user: {username}")
             return
 
         existing_member = self.db_handler.get_member_info(username)
-        if not existing_member:
-            member_info = {
-                "user_id": str(uuid.uuid4()),
-                "username": username,
-                "email": "NA",
-                "membership": "NA",
-                "joined_on": datetime.utcnow().strftime('%Y-%m-%d')
-            }
-            success = self.db_handler.insert_member_local(member_info)
-            if not success:
-                self.status_bar.showMessage(f"Face registered but failed to save user: {username}", 5000)
-                QMessageBox.warning(self, "Registration Partial", f"Face saved, but member record failed: {username}")
-                return
+        member_info = dict(pending_profile or {})
+        member_info.setdefault("username", username)
+        member_info.setdefault("email", "NA")
+        member_info.setdefault("membership", "Basic")
+        member_info.setdefault("joined_on", datetime.utcnow().strftime('%Y-%m-%d'))
+        member_info["user_id"] = existing_member.get("user_id") if existing_member else str(uuid.uuid4())
+
+        upsert_success = self.db_handler.insert_member_local(member_info)
+        if not upsert_success:
+            self.status_bar.showMessage(f"Face registered but failed to save user: {username}", 5000)
+            QMessageBox.warning(self, "Registration Partial", f"Face saved, but member record failed: {username}")
+            return
 
         self.status_bar.showMessage(f"Registered new user: {username}", 5000)
         self.member_list_page.load_members()
@@ -986,10 +1231,12 @@ class MainWindow(QMainWindow):
                     self.status_bar.showMessage(f"Added {username} to local database.", 5000)
                     self.global_face_recognizer.reload_model()
                     self.member_list_page.load_members()
+                    member = self.db_handler.get_member_info(username) or member_info
                 else:
                     self.status_bar.showMessage(f"Failed to add {username} to local database.", 5000)
                     QMessageBox.warning(self, "Registration Failed", f"Could not register user: {username}")
-            self.profile_page.update_profile(user_info)
+                    return
+            self.profile_page.update_profile(member or user_info)
 
     def delete_current_exercise(self):
         current_idx = self.tabs.currentIndex()
@@ -1106,13 +1353,122 @@ class MainWindow(QMainWindow):
         if self.smart_mirror_window:
             logging.debug("Counters updated reps=%s sets=%s", reps, sets)
 
-    def sync_local_data_to_sqlite(self):
+    def _should_run_transfer_sync(self):
+        if self.is_edge_mode:
+            return False
+        if (self.system_config.get("node_role") or "MAIN").upper() != "MAIN":
+            return False
+        now = time.monotonic()
+        if (now - self._last_sync_transfer_at) < self._sync_transfer_min_gap_sec:
+            return False
+        self._last_sync_transfer_at = now
+        return True
+
+    @staticmethod
+    def _is_local_machine_ip(ip):
+        ip = (ip or "").strip()
+        if not ip:
+            return False
+        if ip in {"127.0.0.1", "localhost"}:
+            return True
+        local_ips = {"127.0.0.1"}
+        try:
+            local_ips.update(socket.gethostbyname_ex(socket.gethostname())[2])
+        except Exception:
+            pass
+        return ip in local_ips
+
+    def _pull_edge_data_to_main(self):
+        pulled_total = 0
+
+        for edge in self.edge_devices:
+            ip = (edge.get("ip") or "").strip()
+            username = (edge.get("username") or "").strip()
+            password = (edge.get("password") or "").strip()
+            remote_dir = (edge.get("remote_dir") or "~/smart_mirror_edge").strip()
+            if not ip or not username or not password:
+                continue
+
+            ok, records, details = self.edge_device_manager.fetch_pending_exercise_data(
+                ip=ip,
+                username=username,
+                password=password,
+                remote_dir=remote_dir,
+                limit=500,
+                db_backend=edge.get("db_backend", "postgres"),
+                pg_db=edge.get("pg_db", "gym_edge_db"),
+                pg_user=resolve_edge_pg_user(edge),
+                pg_password=resolve_edge_pg_password(edge),
+                pg_host=edge.get("pg_host", "localhost"),
+                pg_port=edge.get("pg_port", "5432"),
+                progress_callback=self.update_status,
+            )
+            if not ok:
+                self.update_status(f"Edge pull failed for {ip}: {details}")
+                continue
+            if not records:
+                continue
+
+            applied, applied_record_ids = self.db_handler.upsert_edge_records(
+                records,
+                source_edge_ip=ip,
+                return_record_ids=True,
+            )
+            pulled_total += applied
+            if applied < len(records):
+                self.update_status(
+                    f"Edge {ip}: applied {applied}/{len(records)} record(s); unresolved records will retry."
+                )
+            if applied > 0 and applied_record_ids:
+                ack_ok, ack_details = self.edge_device_manager.mark_remote_records_synced(
+                    ip=ip,
+                    username=username,
+                    password=password,
+                    record_ids=applied_record_ids,
+                    remote_dir=remote_dir,
+                    status="SYNCED",
+                    db_backend=edge.get("db_backend", "postgres"),
+                    pg_db=edge.get("pg_db", "gym_edge_db"),
+                    pg_user=resolve_edge_pg_user(edge),
+                    pg_password=resolve_edge_pg_password(edge),
+                    pg_host=edge.get("pg_host", "localhost"),
+                    pg_port=edge.get("pg_port", "5432"),
+                    progress_callback=self.update_status,
+                )
+                if not ack_ok:
+                    self.update_status(f"Edge ACK failed for {ip}: {ack_details}")
+                else:
+                    self.update_status(f"Edge {ip}: pulled and ACKed {applied} record(s).")
+        return pulled_total
+
+    def _pull_local_edge_data_to_main(self, limit=500):
+        _ = limit
+        return 0
+
+    def _sync_main_to_server(self):
+        synced = 0
+        if not hasattr(self, "server_sync_client"):
+            return synced
+        ok, message, synced = self.server_sync_client.push_pending(limit=500)
+        if message:
+            self.update_status(message)
+        if not ok:
+            logging.warning("Main->Server sync issue: %s", message)
+        return synced
+
+    def sync_local_data_to_postgres(self, force_transfer=False):
         if self._is_shutting_down:
             return
         try:
             self.home_page.refresh_summary()
             self.home_page.load_recent_activities()
             self.member_list_page.load_members()
+
+            if force_transfer or self._should_run_transfer_sync():
+                if force_transfer:
+                    self._last_sync_transfer_at = time.monotonic()
+                self._pull_edge_data_to_main()
+                self._sync_main_to_server()
         except Exception as exc:
             logging.error("Dashboard refresh failed: %s", exc)
 
@@ -1138,6 +1494,8 @@ class MainWindow(QMainWindow):
 
         # Final dashboard sync while DB is still open.
         try:
+            self._pull_edge_data_to_main()
+            self._sync_main_to_server()
             self.home_page.refresh_summary()
             self.home_page.load_recent_activities()
             self.member_list_page.load_members()

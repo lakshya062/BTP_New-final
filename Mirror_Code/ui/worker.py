@@ -5,6 +5,7 @@ import face_recognition as fr_lib
 import mediapipe as mp
 import logging
 import os
+import time
 import uuid
 from datetime import datetime
 
@@ -91,6 +92,11 @@ class ExerciseWorker(QThread):
         self.exercise_analysis_active = False
         self.exercise_analyzer = None
         self.current_user_info = None
+        self.exit_save_retry_limit = max(
+            0,
+            int(os.getenv("SMART_MIRROR_EXIT_SAVE_RETRY_LIMIT", "2")),
+        )
+        self._exit_save_retry_count = 0
 
         self.known_frames = 0
         self.last_recognized_user = None
@@ -108,6 +114,16 @@ class ExerciseWorker(QThread):
         self.assigned_user_name = (assigned_user_name or "Athlete").strip() or "Athlete"
         self.display_user_name = self.assigned_user_name
         self.last_audio_message = ""
+        self._last_audio_emit_ts = 0.0
+        self._audio_min_gap_sec = 1.3
+        self._audio_repeat_suppression_sec = 4.0
+        self._audio_warning_active = False
+        self._audio_ready_announced = False
+        self._audio_last_set_announced = -1
+        self._audio_last_rep_marker = (-1, -1)
+        self._audio_last_range_marker = None
+        self._rep_progress_key = (0, 0)
+        self._rep_progress_ts = time.monotonic()
         self.aruco_dict_type = ArucoDetector.normalize_dict_type(aruco_dict_type)
         self.is_edge_mode = os.environ.get("SMART_MIRROR_EDGE_MODE", "0") == "1"
         default_disable_aruco = "1" if self.is_edge_mode else "0"
@@ -133,6 +149,17 @@ class ExerciseWorker(QThread):
         self._label_scores = {}
         self._stable_primary_label = None
         self._frames_without_primary_face = 0
+
+    def _switch_to_face_recognition_mode(self, reason="Returning to Face Recognition Mode."):
+        self.exercise_analyzer = None
+        self.exercise_analysis_active = False
+        self.face_recognition_active = True
+        self.current_user_info = None
+        self.display_user_name = self.assigned_user_name
+        self._exit_save_retry_count = 0
+        self._reset_face_recognition_state()
+        self.status_signal.emit(reason)
+        logging.info(reason)
 
     def _select_primary_face_index(self, face_locations):
         if not face_locations:
@@ -189,40 +216,184 @@ class ExerciseWorker(QThread):
             return self._stable_primary_label
         return top_label
 
-    def _emit_important_audio(self, feedback_texts):
-        critical_feedback = [
-            text
-            for text in feedback_texts
-            if "Warning" in text or "Set complete!" in text or "Ready to start!" in text
-        ]
-        if critical_feedback:
-            current = critical_feedback[0]
-            if current != self.last_audio_message:
-                self.audio_feedback_signal.emit(current)
-                self.last_audio_message = current
-        else:
-            self.last_audio_message = ""
+    def _emit_audio_message(self, text, force=False):
+        text = (text or "").strip()
+        if not text:
+            return False
+
+        now = time.monotonic()
+        if not force and (now - self._last_audio_emit_ts) < self._audio_min_gap_sec:
+            return False
+        if (
+            text == self.last_audio_message
+            and (now - self._last_audio_emit_ts) < self._audio_repeat_suppression_sec
+        ):
+            return False
+
+        self.audio_feedback_signal.emit(text)
+        self.last_audio_message = text
+        self._last_audio_emit_ts = now
+        return True
+
+    def _emit_important_audio(self, feedback_texts, metrics=None):
+        metrics = metrics or {}
+        reps = int(
+            metrics.get(
+                "rep_count",
+                self.exercise_analyzer.rep_count if self.exercise_analyzer else 0,
+            )
+        )
+        sets_done = int(
+            metrics.get(
+                "set_count",
+                self.exercise_analyzer.set_count if self.exercise_analyzer else 0,
+            )
+        )
+        cfg = exercise_config.get(self.exercise_choice, {})
+        reps_per_set = int(cfg.get("reps_per_set", 12))
+
+        warning_detected = any("Warning" in text for text in feedback_texts)
+        ready_detected = "Ready to start!" in feedback_texts
+        set_complete_detected = "Set complete!" in feedback_texts
+        up_range_miss = bool(metrics.get("up_range_miss", False))
+        down_range_miss = bool(metrics.get("down_range_miss", False))
+
+        if warning_detected:
+            if not self._audio_warning_active and self._emit_audio_message(
+                "Form warning. Reset posture and keep your torso stable."
+            ):
+                self._audio_warning_active = True
+            return
+
+        self._audio_warning_active = False
+
+        if ready_detected and not self._audio_ready_announced:
+            if self._emit_audio_message("Start position matched. Begin your reps."):
+                self._audio_ready_announced = True
+            return
+
+        if set_complete_detected:
+            if sets_done != self._audio_last_set_announced and self._emit_audio_message(
+                f"Set {sets_done} complete. Great work.",
+                force=True,
+            ):
+                self._audio_last_set_announced = sets_done
+                self._audio_ready_announced = False
+                self._audio_last_rep_marker = (sets_done, -1)
+            return
+
+        range_marker = None
+        range_message = None
+        if up_range_miss:
+            range_marker = (sets_done, reps, "up")
+            range_message = "Go higher. Reach the top range before lowering."
+        elif down_range_miss:
+            range_marker = (sets_done, reps, "down")
+            range_message = "Lower fully. Reach the down range before next rep."
+
+        if range_marker is not None:
+            if range_marker != self._audio_last_range_marker and self._emit_audio_message(
+                range_message
+            ):
+                self._audio_last_range_marker = range_marker
+            return
+
+        self._audio_last_range_marker = None
+
+        if reps_per_set <= 0 or reps <= 0:
+            return
+
+        halfway_rep = max(1, reps_per_set // 2)
+        final_push_rep = max(1, reps_per_set - 2)
+        milestone_messages = {
+            1: "First rep locked in. Keep your tempo.",
+            halfway_rep: "Halfway there. Stay strict and controlled.",
+            final_push_rep: "Final reps. Drive through with clean form.",
+        }
+        milestone_message = milestone_messages.get(reps)
+        marker = (sets_done, reps)
+        if (
+            milestone_message
+            and marker != self._audio_last_rep_marker
+            and self._emit_audio_message(milestone_message)
+        ):
+            self._audio_last_rep_marker = marker
+
+    def _rep_stagnation_seconds(self, reps, sets_done, stable_start_detected):
+        now = time.monotonic()
+        progress_key = (sets_done, reps)
+        if progress_key != self._rep_progress_key:
+            self._rep_progress_key = progress_key
+            self._rep_progress_ts = now
+            return 0.0
+        if not stable_start_detected or reps <= 0:
+            self._rep_progress_ts = now
+            return 0.0
+        return max(0.0, now - self._rep_progress_ts)
 
     def _resolve_user_name(self):
         if self.current_user_info and self.current_user_info.get("username"):
             return self.current_user_info.get("username")
         return self.display_user_name
 
-    def _motivation_line(self, reps, sets_done, reps_per_set, feedback_texts, status_hint=""):
+    def _motivation_line(
+        self,
+        reps,
+        sets_done,
+        reps_per_set,
+        feedback_texts,
+        status_hint="",
+        rep_state=0,
+        stable_start_detected=False,
+        up_range_miss=False,
+        down_range_miss=False,
+        stagnant_seconds=0.0,
+    ):
         if any("Warning" in text for text in feedback_texts):
-            return "Fix your form and stay controlled on every rep."
+            return "Reset your posture first, then we go again with control."
+        if up_range_miss:
+            return "You are close. Lift a little higher and squeeze at the top."
+        if down_range_miss:
+            return "Nice effort. Lower all the way down, then start the next curl."
         if "Set complete!" in feedback_texts:
-            return "Excellent set. Breathe and reset for the next one."
+            return "Great set. Take two deep breaths and get ready for the next round."
         if "Ready to start!" in feedback_texts:
-            return "You are locked in. Start your first rep."
+            return "Setup looks strong. Start smooth and own the first rep."
+
+        if stable_start_detected and reps > 0:
+            if stagnant_seconds >= 14:
+                lines = [
+                    "You are not done yet. One clean rep breaks this plateau.",
+                    "Stay with me. Elbows tight, breathe out, and finish this rep.",
+                    "Tough moment right now. Slow down, reset, and drive through.",
+                ]
+                return lines[int(stagnant_seconds // 4) % len(lines)]
+            if stagnant_seconds >= 8:
+                lines = [
+                    "You are stuck on this rep. Small reset, then go again.",
+                    "Keep calm and stay tight. You can get this next rep.",
+                    "One solid rep right now. Controlled up, controlled down.",
+                ]
+                return lines[int(stagnant_seconds // 3) % len(lines)]
+
+        if stable_start_detected and sets_done == 0 and reps == 0:
+            return "Start position locked. Curl up with intent and return with control."
         if sets_done > 0 and reps == 0:
-            return "Strong set. Keep your rhythm going."
+            return "Strong previous set. Stay composed and attack this next one."
+        if reps_per_set > 0 and reps >= max(1, int(reps_per_set * 0.9)):
+            return "Last push. Finish every inch of these final reps."
         if reps_per_set > 0 and reps >= max(1, int(reps_per_set * 0.75)):
-            return "Final reps. Drive through with clean form."
+            return "You are in the hard zone now. Keep your form crisp."
         if reps_per_set > 0 and reps >= max(1, reps_per_set // 2):
-            return "Halfway done. Keep the pace strong."
+            return "Halfway there. Keep breathing and keep moving clean."
+        if reps_per_set > 0 and reps >= max(1, int(reps_per_set * 0.25)):
+            return "Rhythm looks good. Stack clean reps one by one."
         if reps > 0:
-            return "Smooth and steady. Own each repetition."
+            if rep_state == 1:
+                return "Drive up through the curl. Elbows stay pinned."
+            if rep_state == 2:
+                return "Control the way down. Earn the full range."
+            return "Good tempo. Stay smooth and keep tension."
         if status_hint:
             return status_hint
         return "Stand centered and start when you are ready."
@@ -265,6 +436,35 @@ class ExerciseWorker(QThread):
 
         cfg = exercise_config.get(self.exercise_choice, {})
         reps_per_set = int(cfg.get("reps_per_set", 12))
+        rep_angle_raw = metrics.get("rep_angle")
+        rep_angle = float(rep_angle_raw) if rep_angle_raw is not None else None
+
+        up_range_raw = metrics.get("up_range")
+        down_range_raw = metrics.get("down_range")
+        up_range = (
+            (float(up_range_raw[0]), float(up_range_raw[1]))
+            if isinstance(up_range_raw, (list, tuple)) and len(up_range_raw) == 2
+            else None
+        )
+        down_range = (
+            (float(down_range_raw[0]), float(down_range_raw[1]))
+            if isinstance(down_range_raw, (list, tuple)) and len(down_range_raw) == 2
+            else None
+        )
+        rep_state = int(metrics.get("rep_state", self.exercise_analyzer.rep_state if self.exercise_analyzer else 0))
+        stable_start_detected = bool(
+            metrics.get(
+                "stable_start_detected",
+                self.exercise_analyzer.stable_start_detected if self.exercise_analyzer else False,
+            )
+        )
+        up_range_miss = bool(metrics.get("up_range_miss", False))
+        down_range_miss = bool(metrics.get("down_range_miss", False))
+        stagnant_seconds = self._rep_stagnation_seconds(
+            reps,
+            sets_done,
+            stable_start_detected,
+        )
 
         return {
             "username": self._resolve_user_name(),
@@ -275,7 +475,31 @@ class ExerciseWorker(QThread):
             "reps_per_set": reps_per_set,
             "angles_line": self._format_angle_line(angles),
             "timestamp": datetime.now().strftime("%d %b %Y | %I:%M:%S %p"),
-            "motivation": self._motivation_line(reps, sets_done, reps_per_set, feedback_texts, status_hint),
+            "motivation": self._motivation_line(
+                reps,
+                sets_done,
+                reps_per_set,
+                feedback_texts,
+                status_hint,
+                rep_state=rep_state,
+                stable_start_detected=stable_start_detected,
+                up_range_miss=up_range_miss,
+                down_range_miss=down_range_miss,
+                stagnant_seconds=stagnant_seconds,
+            ),
+            "rep_angle": rep_angle,
+            "up_range": up_range,
+            "down_range": down_range,
+            "rep_state": rep_state,
+            "up_range_miss": up_range_miss,
+            "down_range_miss": down_range_miss,
+            "show_range_bars": (
+                self.exercise_choice == "bicep_curl"
+                and stable_start_detected
+                and rep_angle is not None
+                and up_range is not None
+                and down_range is not None
+            ),
         }
 
     def _draw_live_overlay(self, frame, overlay_data, feedback_texts=None):
@@ -423,6 +647,143 @@ class ExerciseWorker(QThread):
             max(1, int(2 * scale)),
             cv2.LINE_AA,
         )
+
+        if overlay_data.get("show_range_bars"):
+            rep_angle = float(overlay_data.get("rep_angle") or 0.0)
+            up_range = overlay_data.get("up_range") or (0.0, 0.0)
+            down_range = overlay_data.get("down_range") or (0.0, 0.0)
+            up_min, up_max = float(up_range[0]), float(up_range[1])
+            down_min, down_max = float(down_range[0]), float(down_range[1])
+            rep_state = int(overlay_data.get("rep_state", 0))
+            blink_on = ((datetime.now().microsecond // 180000) % 2) == 0
+
+            range_panel_w = int(390 * scale)
+            range_panel_h = int(154 * scale)
+            range_x = max(margin, w - range_panel_w - margin)
+            range_y = time_y + time_panel_h + int(12 * scale)
+            draw_translucent_panel(
+                frame,
+                range_x,
+                range_y,
+                range_panel_w,
+                range_panel_h,
+                fill_color=(22, 30, 43),
+                border_color=(108, 201, 255),
+                alpha=0.64,
+                border_thickness=max(1, int(2 * scale)),
+            )
+            cv2.putText(
+                frame,
+                "RANGE CHECK",
+                (range_x + int(16 * scale), range_y + int(28 * scale)),
+                font,
+                0.58 * scale,
+                (232, 244, 255),
+                max(1, int(2 * scale)),
+                cv2.LINE_AA,
+            )
+
+            bar_left = range_x + int(16 * scale)
+            bar_w = range_panel_w - int(32 * scale)
+            bar_h = int(18 * scale)
+            up_bar_y = range_y + int(48 * scale)
+            down_bar_y = range_y + int(100 * scale)
+
+            angle_span = max(1.0, down_max - up_min)
+            up_progress = max(0.0, min(1.0, (down_max - rep_angle) / angle_span))
+            down_progress = max(0.0, min(1.0, (rep_angle - up_min) / angle_span))
+            up_hit = up_min <= rep_angle <= up_max
+            down_hit = down_min <= rep_angle <= down_max
+            up_miss = bool(overlay_data.get("up_range_miss", False))
+            down_miss = bool(overlay_data.get("down_range_miss", False))
+
+            def draw_range_bar(label, y, progress, target_min, target_max, in_target, expected_now, miss_now):
+                draw_translucent_panel(
+                    frame,
+                    bar_left,
+                    y,
+                    bar_w,
+                    bar_h,
+                    fill_color=(26, 38, 54),
+                    border_color=(76, 132, 188),
+                    alpha=0.74,
+                    border_thickness=max(1, int(1 * scale)),
+                )
+
+                fill_w = max(1, int(bar_w * progress))
+                if in_target:
+                    fill_color = (64, 188, 120)
+                    border_color = (118, 242, 130)
+                    state_text = "ON TARGET"
+                elif miss_now and blink_on:
+                    fill_color = (52, 46, 188)
+                    border_color = (92, 92, 255)
+                    state_text = "MISSED RANGE"
+                elif expected_now:
+                    fill_color = (82, 132, 214)
+                    border_color = (116, 168, 248)
+                    state_text = "IN PROGRESS"
+                else:
+                    fill_color = (66, 108, 164)
+                    border_color = (100, 144, 206)
+                    state_text = "READY"
+
+                cv2.rectangle(
+                    frame,
+                    (bar_left, y),
+                    (bar_left + fill_w, y + bar_h),
+                    fill_color,
+                    -1,
+                )
+                cv2.rectangle(
+                    frame,
+                    (bar_left, y),
+                    (bar_left + bar_w, y + bar_h),
+                    border_color,
+                    max(1, int(2 * scale)),
+                )
+
+                cv2.putText(
+                    frame,
+                    f"{label} {int(target_min)}-{int(target_max)}deg",
+                    (bar_left, y - int(7 * scale)),
+                    font,
+                    0.46 * scale,
+                    (196, 220, 246),
+                    max(1, int(1 * scale)),
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    frame,
+                    state_text,
+                    (bar_left + int(6 * scale), y + bar_h + int(16 * scale)),
+                    font,
+                    0.44 * scale,
+                    (214, 232, 250),
+                    max(1, int(1 * scale)),
+                    cv2.LINE_AA,
+                )
+
+            draw_range_bar(
+                "UP",
+                up_bar_y,
+                up_progress,
+                up_min,
+                up_max,
+                up_hit,
+                rep_state == 1,
+                up_miss,
+            )
+            draw_range_bar(
+                "DOWN",
+                down_bar_y,
+                down_progress,
+                down_min,
+                down_max,
+                down_hit,
+                rep_state == 2,
+                down_miss,
+            )
 
         motivation_h = int(72 * scale)
         motivation_x = margin
@@ -582,7 +943,7 @@ class ExerciseWorker(QThread):
                                 ),
                             )
 
-                            self._emit_important_audio(feedback_texts)
+                            self._emit_important_audio(feedback_texts, overlay_metrics)
 
                             overlay_data = self._build_overlay_data(overlay_metrics, feedback_texts)
                             self._draw_live_overlay(frame_bgr, overlay_data, feedback_texts)
@@ -627,20 +988,37 @@ class ExerciseWorker(QThread):
                             if self.exercise_analyzer.no_pose_frames >= occlusion_timeout:
                                 self.status_signal.emit("Person exited the frame, updating database...")
                                 logging.info("Person exited frame. Updating database.")
+                                had_activity = bool(
+                                    self.exercise_analyzer.rep_data
+                                    or self.exercise_analyzer.rep_count > 0
+                                    or self.exercise_analyzer.set_count > 0
+                                    or self.exercise_analyzer.sets_reps
+                                )
                                 record = self.exercise_analyzer.update_data()
                                 if record:
+                                    self._exit_save_retry_count = 0
                                     self.status_signal.emit("Exercise data saved locally.")
                                     logging.info("Data saved locally.")
                                     self.data_updated.emit()
+                                    next_mode_reason = "Person exited frame. Ready for next user."
+                                elif had_activity:
+                                    self._exit_save_retry_count = 0
+                                    logging.error(
+                                        "Exercise session had activity but save returned no record. "
+                                        "Resetting session state for next user."
+                                    )
+                                    self.status_signal.emit(
+                                        "Failed to save exercise data. Resetting for next user."
+                                    )
+                                    self.exercise_analyzer.reset_counters()
+                                    next_mode_reason = "Person exited frame. Reset complete. Waiting for recognition."
                                 else:
+                                    self._exit_save_retry_count = 0
                                     self.status_signal.emit("No exercise data to save.")
+                                    next_mode_reason = "Person exited frame. Waiting for recognition."
 
-                                self.exercise_analyzer = None
-                                self.exercise_analysis_active = False
-                                self.face_recognition_active = True
-                                self._reset_face_recognition_state()
-                                self.status_signal.emit("Returning to Face Recognition Mode.")
-                                logging.info("Switched back to Face Recognition Mode.")
+                                self._switch_to_face_recognition_mode(reason=next_mode_reason)
+                                self.counters_signal.emit(0, 0)
 
                         self.msleep(10)
                         continue
@@ -877,7 +1255,9 @@ class ExerciseWorker(QThread):
                                         aruco_detector,
                                         self.db_handler,
                                         user_id=user_info.get("user_id"),
+                                        username_snapshot=recognized_user,
                                     )
+                                    self._exit_save_retry_count = 0
                                     self.exercise_analysis_active = True
                                     self.face_recognition_active = False
                                     self._reset_face_recognition_state()

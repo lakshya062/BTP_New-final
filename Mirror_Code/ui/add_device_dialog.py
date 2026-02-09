@@ -1,3 +1,5 @@
+import ipaddress
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -54,11 +56,22 @@ class AddDeviceDialog(QDialog):
         self.display_input = QLineEdit(":0")
         form_layout.addRow("Remote DISPLAY:", self.display_input)
 
+        self.manual_ip_input = QLineEdit()
+        self.manual_ip_input.setPlaceholderText("Optional manual edge IP, e.g. 192.168.1.42")
+        form_layout.addRow("Manual IP:", self.manual_ip_input)
+
         self.install_deps_checkbox = QCheckBox(
             "Force dependency reinstall on Start All"
         )
         self.install_deps_checkbox.setChecked(False)
         form_layout.addRow("", self.install_deps_checkbox)
+
+        self.setup_postgres_checkbox = QCheckBox(
+            "Setup PostgreSQL on edge and apply edge schema during deploy (required)"
+        )
+        self.setup_postgres_checkbox.setChecked(True)
+        self.setup_postgres_checkbox.setEnabled(False)
+        form_layout.addRow("", self.setup_postgres_checkbox)
 
         root_layout.addLayout(form_layout)
 
@@ -95,12 +108,12 @@ class AddDeviceDialog(QDialog):
         if not username:
             self.status_label.setText("Enter SSH username before scanning.")
             return
-        if not password:
-            self.status_label.setText("Enter SSH password before scanning.")
-            return
 
         self.scan_button.setEnabled(False)
-        self.status_label.setText("Scanning network interfaces for SSH devices...")
+        if password:
+            self.status_label.setText("Scanning network interfaces for SSH devices (with Linux verification)...")
+        else:
+            self.status_label.setText("Scanning network interfaces for SSH devices (without Linux verification)...")
         try:
             devices = self.edge_device_manager.discover_devices(
                 username=username,
@@ -132,20 +145,27 @@ class AddDeviceDialog(QDialog):
         )
 
     def validate_and_accept(self):
-        if not self.discovered_devices:
+        manual_ip = self.manual_ip_input.text().strip()
+        if manual_ip:
+            try:
+                ipaddress.ip_address(manual_ip)
+            except ValueError:
+                QMessageBox.warning(self, "Invalid IP", "Manual IP address format is invalid.")
+                return
+        elif not self.discovered_devices:
             QMessageBox.warning(
                 self,
                 "No Device Selected",
-                "No devices discovered. Please scan and select a device.",
+                "No devices discovered. Scan again or provide a manual IP.",
             )
             return
 
         current_index = self.device_dropdown.currentIndex()
-        if current_index < 0:
+        if current_index < 0 and not manual_ip:
             QMessageBox.warning(
                 self,
                 "No Device Selected",
-                "Please select an edge device from the dropdown.",
+                "Select an edge device from the dropdown or enter a manual IP.",
             )
             return
 
@@ -159,11 +179,20 @@ class AddDeviceDialog(QDialog):
         self.accept()
 
     def get_selection(self):
-        idx = self.device_dropdown.currentIndex()
-        selected_device = self.discovered_devices[idx] if idx >= 0 else DiscoveredEdgeDevice(
-            ip="",
-            interface="",
-        )
+        manual_ip = self.manual_ip_input.text().strip()
+        if manual_ip:
+            selected_device = DiscoveredEdgeDevice(
+                ip=manual_ip,
+                interface="manual",
+                hostname="manual-entry",
+                linux_verified=False,
+            )
+        else:
+            idx = self.device_dropdown.currentIndex()
+            selected_device = self.discovered_devices[idx] if idx >= 0 else DiscoveredEdgeDevice(
+                ip="",
+                interface="",
+            )
         return {
             "device": selected_device,
             "username": self.username_input.text().strip(),
@@ -171,6 +200,7 @@ class AddDeviceDialog(QDialog):
             "remote_dir": self.remote_dir_input.text().strip(),
             "display": self.display_input.text().strip(),
             "install_deps": self.install_deps_checkbox.isChecked(),
+            "setup_postgres": True,
         }
 
     @staticmethod

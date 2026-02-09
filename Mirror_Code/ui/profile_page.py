@@ -76,18 +76,30 @@ class ProfilePage(QWidget):
     def update_profile(self, user_info):
         """Update the profile display with user information."""
         username = user_info.get("username", "Unknown")
+        first_name = user_info.get("first_name") or ""
+        last_name = user_info.get("last_name") or ""
+        full_name = f"{first_name} {last_name}".strip()
         email = user_info.get("email", "Unknown")
         membership = user_info.get("membership", "Unknown")
-        joined_on = user_info.get("joined_on", "Unknown")
-        user_id = user_info.get("user_id", "Unknown")
+        phone = user_info.get("phone") or "N/A"
+        date_of_birth = user_info.get("date_of_birth") or "N/A"
+        height_cm = user_info.get("height_cm")
+        weight_kg = user_info.get("weight_kg")
+
+        body_stats = []
+        if height_cm not in (None, ""):
+            body_stats.append(f"Height: {height_cm} cm")
+        if weight_kg not in (None, ""):
+            body_stats.append(f"Weight: {weight_kg} kg")
+        body_stats_text = " | ".join(body_stats) if body_stats else "Height/Weight: N/A"
 
         # Update Labels
-        self.name_label.setText(f"Name: {username}")
+        display_name = full_name if full_name else username
+        self.name_label.setText(f"Name: {display_name} (@{username})")
         self.email_label.setText(f"Email: {email}")
         self.membership_label.setText(f"Membership: {membership}")
-        # Assuming contact and address are stored or can be fetched; using placeholders
-        self.contact_label.setText(f"Contact: +1 234 567 8901")
-        self.address_label.setText(f"Address: 123 Fitness Ave, Gym City")
+        self.contact_label.setText(f"Contact: {phone}")
+        self.address_label.setText(f"DOB: {date_of_birth} | {body_stats_text}")
 
         # Update Profile Picture if available
         profile_pic_path = resource_path("profiles", f"{username}.png")

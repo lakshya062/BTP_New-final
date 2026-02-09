@@ -6,8 +6,9 @@ from .database import DatabaseHandler
 
 
 class LocalDatabaseHandler:
-    def __init__(self, db_file="local_members.db"):
-        self._handler = DatabaseHandler(local_db_file=db_file)
+    def __init__(self, db_file=None):
+        _ = db_file
+        self._handler = DatabaseHandler()
 
     def insert_member(self, member_info):
         return self._handler.insert_member_local(member_info)

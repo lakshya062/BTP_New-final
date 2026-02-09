@@ -4,6 +4,7 @@ import sys
 import os
 import faulthandler
 import warnings
+from datetime import datetime
 from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtCore import Qt
@@ -19,6 +20,9 @@ def _configure_runtime_diagnostics():
     try:
         fault_log_path = project_path("edge_fault.log")
         _fault_log_file = open(fault_log_path, "a", buffering=1)
+        _fault_log_file.write(
+            f"\n=== Session {datetime.utcnow().isoformat()}Z pid={os.getpid()} ===\n"
+        )
         faulthandler.enable(file=_fault_log_file, all_threads=True)
     except Exception:
         _fault_log_file = None
