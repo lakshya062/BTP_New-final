@@ -1,0 +1,136 @@
+{
+  "asset": "/Users/lakshyasharan/Desktop/Transferred/Transfer/Gym Startup/Modular_code/Modular_final/FINAL FINAL_BTP/BTP_New-final/Mirror_Code/Testing/human_body_autorig.glb",
+  "config": "/Users/lakshyasharan/Desktop/Transferred/Transfer/Gym Startup/Modular_code/Modular_final/FINAL FINAL_BTP/BTP_New-final/Mirror_Code/Testing/human_body_autorig.retarget.json",
+  "status": "ok",
+  "note": "Smoke-test quaternions from synthetic pose. Use as integration sanity check only.",
+  "rotations": {
+    "left_upper_arm": {
+      "bone": "AutoRig_LeftUpperArm",
+      "from_keypoint": "5_left_shoulder",
+      "to_keypoint": "7_left_elbow",
+      "direction_xyz": [
+        -0.478852242231369,
+        0.8778955936431885,
+        0.0
+      ],
+      "rotation_quat_wxyz": [
+        0.1212042048573494,
+        -0.0,
+        -0.0,
+        -0.9926275610923767
+      ]
+    },
+    "left_lower_arm": {
+      "bone": "AutoRig_LeftLowerArm",
+      "from_keypoint": "7_left_elbow",
+      "to_keypoint": "9_left_wrist",
+      "direction_xyz": [
+        -0.31622767448425293,
+        0.9486832618713379,
+        0.0
+      ],
+      "rotation_quat_wxyz": [
+        0.05124923959374428,
+        -0.0,
+        -0.0,
+        -0.9986858367919922
+      ]
+    },
+    "right_upper_arm": {
+      "bone": "AutoRig_RightUpperArm",
+      "from_keypoint": "6_right_shoulder",
+      "to_keypoint": "8_right_elbow",
+      "direction_xyz": [
+        0.478852242231369,
+        0.8778955936431885,
+        0.0
+      ],
+      "rotation_quat_wxyz": [
+        0.1212042048573494,
+        -0.0,
+        0.0,
+        0.9926275610923767
+      ]
+    },
+    "right_lower_arm": {
+      "bone": "AutoRig_RightLowerArm",
+      "from_keypoint": "8_right_elbow",
+      "to_keypoint": "10_right_wrist",
+      "direction_xyz": [
+        0.31622791290283203,
+        0.9486832618713379,
+        0.0
+      ],
+      "rotation_quat_wxyz": [
+        0.05124930292367935,
+        -0.0,
+        0.0,
+        0.998685896396637
+      ]
+    },
+    "left_upper_leg": {
+      "bone": "AutoRig_LeftUpperLeg",
+      "from_keypoint": "11_left_hip",
+      "to_keypoint": "13_left_knee",
+      "direction_xyz": [
+        -0.05255893990397453,
+        0.9986178278923035,
+        0.0
+      ],
+      "rotation_quat_wxyz": [
+        0.0013821707107126713,
+        -0.0,
+        -0.0,
+        -0.9999989867210388
+      ]
+    },
+    "left_lower_leg": {
+      "bone": "AutoRig_LeftLowerLeg",
+      "from_keypoint": "13_left_knee",
+      "to_keypoint": "15_left_ankle",
+      "direction_xyz": [
+        -0.051917362958192825,
+        0.986430823802948,
+        0.1557522416114807
+      ],
+      "rotation_quat_wxyz": [
+        0.013567868620157242,
+        -0.9485961198806763,
+        -0.0,
+        -0.31619834899902344
+      ]
+    },
+    "right_upper_leg": {
+      "bone": "AutoRig_RightUpperLeg",
+      "from_keypoint": "12_right_hip",
+      "to_keypoint": "14_right_knee",
+      "direction_xyz": [
+        0.052558783441782,
+        0.9986178278923035,
+        0.0
+      ],
+      "rotation_quat_wxyz": [
+        0.0013821707107126713,
+        -0.0,
+        0.0,
+        0.9999989867210388
+      ]
+    },
+    "right_lower_leg": {
+      "bone": "AutoRig_RightLowerLeg",
+      "from_keypoint": "14_right_knee",
+      "to_keypoint": "16_right_ankle",
+      "direction_xyz": [
+        0.051917362958192825,
+        0.986430823802948,
+        0.1557522416114807
+      ],
+      "rotation_quat_wxyz": [
+        0.013567868620157242,
+        -0.9485961198806763,
+        0.0,
+        0.31619834899902344
+      ]
+    }
+  }
+}

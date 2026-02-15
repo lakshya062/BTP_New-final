@@ -1,0 +1,5 @@
+[gd_scene format=3 uid="uid://bl2xeb64uiani"]
+
+[ext_resource type="PackedScene" uid="uid://bqbun16h1gxdv" path="res://human_body_autorig.glb" id="1_y6kks"]
+
+[node name="Sketchfab_Scene" unique_id=150606298 instance=ExtResource("1_y6kks")]

@@ -1,0 +1,8 @@
+# Optional dependencies for RKNN runtime in rtmpose_realtime.py
+# Use this only on Rockchip Linux devices when running with --engine rknn.
+
+ultralytics>=8.3.0,<9.0.0
+
+# Install rknn toolkit lite on the target board manually if needed:
+#   pip install rknn-toolkit-lite2
+# (Wheels are platform-specific and may not be available on macOS.)

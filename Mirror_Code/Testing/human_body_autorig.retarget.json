@@ -1,0 +1,147 @@
+{
+  "asset_glb": "/Users/lakshyasharan/Desktop/Transferred/Transfer/Gym Startup/Modular_code/Modular_final/FINAL FINAL_BTP/BTP_New-final/Mirror_Code/Testing/human_body_autorig.glb",
+  "skin_index": 0,
+  "joint_count": 19,
+  "skeleton_node": 5,
+  "bone_slots": {
+    "root": "AutoRig_Hips",
+    "spine": "AutoRig_Spine",
+    "chest": "AutoRig_Chest",
+    "neck": "AutoRig_Neck",
+    "head": "AutoRig_Head",
+    "left_shoulder": "AutoRig_LeftShoulder",
+    "left_upper_arm": "AutoRig_LeftUpperArm",
+    "left_lower_arm": "AutoRig_LeftLowerArm",
+    "left_hand": "AutoRig_LeftHand",
+    "right_shoulder": "AutoRig_RightShoulder",
+    "right_upper_arm": "AutoRig_RightUpperArm",
+    "right_lower_arm": "AutoRig_RightLowerArm",
+    "right_hand": "AutoRig_RightHand",
+    "left_upper_leg": "AutoRig_LeftUpperLeg",
+    "left_lower_leg": "AutoRig_LeftLowerLeg",
+    "left_foot": "AutoRig_LeftFoot",
+    "right_upper_leg": "AutoRig_RightUpperLeg",
+    "right_lower_leg": "AutoRig_RightLowerLeg",
+    "right_foot": "AutoRig_RightFoot"
+  },
+  "ik_chains": {
+    "left_arm": {
+      "root": "AutoRig_LeftUpperArm",
+      "mid": "AutoRig_LeftLowerArm",
+      "end": "AutoRig_LeftHand",
+      "pole_hint": "left_elbow_out"
+    },
+    "right_arm": {
+      "root": "AutoRig_RightUpperArm",
+      "mid": "AutoRig_RightLowerArm",
+      "end": "AutoRig_RightHand",
+      "pole_hint": "right_elbow_out"
+    },
+    "left_leg": {
+      "root": "AutoRig_LeftUpperLeg",
+      "mid": "AutoRig_LeftLowerLeg",
+      "end": "AutoRig_LeftFoot",
+      "pole_hint": "left_knee_forward"
+    },
+    "right_leg": {
+      "root": "AutoRig_RightUpperLeg",
+      "mid": "AutoRig_RightLowerLeg",
+      "end": "AutoRig_RightFoot",
+      "pole_hint": "right_knee_forward"
+    }
+  },
+  "detector_keypoint_targets": {
+    "5_left_shoulder": "AutoRig_LeftShoulder",
+    "6_right_shoulder": "AutoRig_RightShoulder",
+    "7_left_elbow": "AutoRig_LeftLowerArm",
+    "8_right_elbow": "AutoRig_RightLowerArm",
+    "9_left_wrist": "AutoRig_LeftHand",
+    "10_right_wrist": "AutoRig_RightHand",
+    "11_left_hip": "AutoRig_LeftUpperLeg",
+    "12_right_hip": "AutoRig_RightUpperLeg",
+    "13_left_knee": "AutoRig_LeftLowerLeg",
+    "14_right_knee": "AutoRig_RightLowerLeg",
+    "15_left_ankle": "AutoRig_LeftFoot",
+    "16_right_ankle": "AutoRig_RightFoot",
+    "0_nose": "AutoRig_Head"
+  },
+  "all_skin_joints": [
+    {
+      "index": 5,
+      "name": "AutoRig_Hips"
+    },
+    {
+      "index": 6,
+      "name": "AutoRig_Spine"
+    },
+    {
+      "index": 7,
+      "name": "AutoRig_Chest"
+    },
+    {
+      "index": 8,
+      "name": "AutoRig_Neck"
+    },
+    {
+      "index": 9,
+      "name": "AutoRig_Head"
+    },
+    {
+      "index": 10,
+      "name": "AutoRig_LeftShoulder"
+    },
+    {
+      "index": 11,
+      "name": "AutoRig_LeftUpperArm"
+    },
+    {
+      "index": 12,
+      "name": "AutoRig_LeftLowerArm"
+    },
+    {
+      "index": 13,
+      "name": "AutoRig_LeftHand"
+    },
+    {
+      "index": 14,
+      "name": "AutoRig_RightShoulder"
+    },
+    {
+      "index": 15,
+      "name": "AutoRig_RightUpperArm"
+    },
+    {
+      "index": 16,
+      "name": "AutoRig_RightLowerArm"
+    },
+    {
+      "index": 17,
+      "name": "AutoRig_RightHand"
+    },
+    {
+      "index": 18,
+      "name": "AutoRig_LeftUpperLeg"
+    },
+    {
+      "index": 19,
+      "name": "AutoRig_LeftLowerLeg"
+    },
+    {
+      "index": 20,
+      "name": "AutoRig_LeftFoot"
+    },
+    {
+      "index": 21,
+      "name": "AutoRig_RightUpperLeg"
+    },
+    {
+      "index": 22,
+      "name": "AutoRig_RightLowerLeg"
+    },
+    {
+      "index": 23,
+      "name": "AutoRig_RightFoot"
+    }
+  ],
+  "warnings": []
+}

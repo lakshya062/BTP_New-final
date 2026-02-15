@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 from datetime import datetime
+from math import hypot
 
 from PySide6.QtCore import QThread, Signal
 
@@ -57,6 +58,28 @@ class ExerciseWorker(QThread):
     data_updated = Signal()
     audio_feedback_signal = Signal(str)
     new_user_registration_signal = Signal(str, bool)
+
+    @staticmethod
+    def _read_int_env(var_name, default, minimum=0):
+        raw = os.getenv(var_name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, value)
+
+    @staticmethod
+    def _read_float_env(var_name, default, minimum=0.0):
+        raw = os.getenv(var_name)
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, value)
 
     def __init__(
         self,
@@ -128,6 +151,38 @@ class ExerciseWorker(QThread):
         self.is_edge_mode = os.environ.get("SMART_MIRROR_EDGE_MODE", "0") == "1"
         default_disable_aruco = "1" if self.is_edge_mode else "0"
         self.disable_aruco = os.environ.get("SMART_MIRROR_DISABLE_ARUCO", default_disable_aruco) == "1"
+        self.exit_no_pose_frames = self._read_int_env(
+            "SMART_MIRROR_EXIT_NO_POSE_FRAMES",
+            default=10,
+            minimum=3,
+        )
+        self.exit_reacquire_grace_seconds = self._read_float_env(
+            "SMART_MIRROR_EXIT_REACQUIRE_GRACE_SECONDS",
+            default=0.65,
+            minimum=0.0,
+        )
+        self.pose_acquire_grace_frames = self._read_int_env(
+            "SMART_MIRROR_POSE_ACQUIRE_GRACE_FRAMES",
+            default=14,
+            minimum=0,
+        )
+        self.pose_visibility_threshold = self._read_float_env(
+            "SMART_MIRROR_MIN_POSE_VISIBILITY",
+            default=0.45,
+            minimum=0.1,
+        )
+        self.min_pose_shoulder_width = self._read_float_env(
+            "SMART_MIRROR_MIN_POSE_SHOULDER_WIDTH",
+            default=0.05,
+            minimum=0.01,
+        )
+        self.min_pose_torso_height = self._read_float_env(
+            "SMART_MIRROR_MIN_POSE_TORSO_HEIGHT",
+            default=0.08,
+            minimum=0.02,
+        )
+        self._analysis_pose_grace_frames_remaining = 0
+        self._last_reliable_pose_ts = 0.0
 
     def request_stop(self):
         self.stop_requested = True
@@ -157,6 +212,8 @@ class ExerciseWorker(QThread):
         self.current_user_info = None
         self.display_user_name = self.assigned_user_name
         self._exit_save_retry_count = 0
+        self._analysis_pose_grace_frames_remaining = 0
+        self._last_reliable_pose_ts = 0.0
         self._reset_face_recognition_state()
         self.status_signal.emit(reason)
         logging.info(reason)
@@ -215,6 +272,48 @@ class ExerciseWorker(QThread):
         if self._stable_primary_label is not None:
             return self._stable_primary_label
         return top_label
+
+    def _has_reliable_pose(self, landmarks):
+        if not landmarks:
+            return False
+        try:
+            left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+            right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+            left_elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
+            right_elbow = landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value]
+            left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
+            right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value]
+
+            left_shoulder_visible = getattr(left_shoulder, "visibility", 0.0) >= self.pose_visibility_threshold
+            right_shoulder_visible = getattr(right_shoulder, "visibility", 0.0) >= self.pose_visibility_threshold
+            if not (left_shoulder_visible and right_shoulder_visible):
+                return False
+
+            arm_visibility_threshold = max(0.2, self.pose_visibility_threshold - 0.15)
+            left_elbow_visible = getattr(left_elbow, "visibility", 0.0) >= arm_visibility_threshold
+            right_elbow_visible = getattr(right_elbow, "visibility", 0.0) >= arm_visibility_threshold
+            if not (left_elbow_visible or right_elbow_visible):
+                return False
+
+            shoulder_width = hypot(
+                float(left_shoulder.x) - float(right_shoulder.x),
+                float(left_shoulder.y) - float(right_shoulder.y),
+            )
+            if shoulder_width < self.min_pose_shoulder_width:
+                return False
+
+            left_hip_visible = getattr(left_hip, "visibility", 0.0) >= self.pose_visibility_threshold
+            right_hip_visible = getattr(right_hip, "visibility", 0.0) >= self.pose_visibility_threshold
+            if left_hip_visible and right_hip_visible:
+                shoulder_mid_y = (float(left_shoulder.y) + float(right_shoulder.y)) / 2.0
+                hip_mid_y = (float(left_hip.y) + float(right_hip.y)) / 2.0
+                torso_height = abs(hip_mid_y - shoulder_mid_y)
+                if torso_height < self.min_pose_torso_height:
+                    return False
+
+            return True
+        except Exception:
+            return False
 
     def _emit_audio_message(self, text, force=False):
         text = (text or "").strip()
@@ -891,7 +990,7 @@ class ExerciseWorker(QThread):
                 logging.error("Face recognizer is not initialized. Worker terminating.")
                 return
 
-            occlusion_timeout = 90  # About 3 seconds at ~30 FPS
+            occlusion_timeout = self.exit_no_pose_frames
 
             while not self.stop_requested:
                 ret, frame = cap.read()
@@ -909,8 +1008,14 @@ class ExerciseWorker(QThread):
                         results = mp_pose_solution.process(frame_rgb)
                         frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-                        if results.pose_landmarks:
+                        reliable_pose = bool(
+                            results.pose_landmarks
+                            and self._has_reliable_pose(results.pose_landmarks.landmark)
+                        )
+                        if reliable_pose:
                             self.exercise_analyzer.no_pose_frames = 0
+                            self._analysis_pose_grace_frames_remaining = 0
+                            self._last_reliable_pose_ts = time.monotonic()
                             landmarks = results.pose_landmarks.landmark
                             feedback_texts, overlay_metrics = self.exercise_analyzer.analyze_exercise_form(
                                 landmarks,
@@ -959,13 +1064,41 @@ class ExerciseWorker(QThread):
                             )
                         else:
                             self.exercise_analyzer.update_current_weight(frame_bgr)
-                            self.exercise_analyzer.no_pose_frames += 1
-                            logging.debug(
-                                "No pose detected. no_pose_frames: %s",
-                                self.exercise_analyzer.no_pose_frames,
+                            grace_active = self._analysis_pose_grace_frames_remaining > 0
+                            start_position_locked = bool(
+                                self.exercise_analyzer
+                                and self.exercise_analyzer.stable_start_detected
                             )
+                            if grace_active:
+                                self._analysis_pose_grace_frames_remaining -= 1
+                                status_hint = "Face recognized. Align upper body to start tracking."
+                            elif not start_position_locked:
+                                # Do not run person-exit logic before start position is locked (green landmarks).
+                                self.exercise_analyzer.no_pose_frames = 0
+                                status_hint = "Move to start position (green lines) to begin tracking."
+                            else:
+                                now = time.monotonic()
+                                if self._last_reliable_pose_ts <= 0.0:
+                                    self._last_reliable_pose_ts = now
+                                seconds_since_reliable = now - self._last_reliable_pose_ts
 
-                            status_hint = "Body not detected. Step back into frame."
+                                if seconds_since_reliable < self.exit_reacquire_grace_seconds:
+                                    self.exercise_analyzer.no_pose_frames = 0
+                                    status_hint = "Tracking lost briefly. Step back in to continue."
+                                else:
+                                    self.exercise_analyzer.no_pose_frames += 1
+                                    if results.pose_landmarks:
+                                        logging.debug(
+                                            "Ignoring unstable pose landmarks during active session (no_pose_frames=%s).",
+                                            self.exercise_analyzer.no_pose_frames,
+                                        )
+                                        status_hint = "Body landmarks unstable. Hold still in frame."
+                                    else:
+                                        logging.debug(
+                                            "No pose detected. no_pose_frames: %s",
+                                            self.exercise_analyzer.no_pose_frames,
+                                        )
+                                        status_hint = "Body not detected. Step back into frame."
                             overlay_data = self._build_overlay_data(
                                 metrics={
                                     "rep_count": self.exercise_analyzer.rep_count,
@@ -985,7 +1118,11 @@ class ExerciseWorker(QThread):
                                 self.exercise_analyzer.set_count,
                             )
 
-                            if self.exercise_analyzer.no_pose_frames >= occlusion_timeout:
+                            if (
+                                not grace_active
+                                and start_position_locked
+                                and self.exercise_analyzer.no_pose_frames >= occlusion_timeout
+                            ):
                                 self.status_signal.emit("Person exited the frame, updating database...")
                                 logging.info("Person exited frame. Updating database.")
                                 had_activity = bool(
@@ -1258,6 +1395,8 @@ class ExerciseWorker(QThread):
                                         username_snapshot=recognized_user,
                                     )
                                     self._exit_save_retry_count = 0
+                                    self._analysis_pose_grace_frames_remaining = self.pose_acquire_grace_frames
+                                    self._last_reliable_pose_ts = time.monotonic()
                                     self.exercise_analysis_active = True
                                     self.face_recognition_active = False
                                     self._reset_face_recognition_state()

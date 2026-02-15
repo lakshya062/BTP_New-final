@@ -1,0 +1,16 @@
+[gd_scene format=3 uid="uid://bpogtp30r1pox"]
+
+[ext_resource type="PackedScene" uid="uid://ca53x3g8b4djr" path="res://human_inherited.tscn" id="2_uu6xs"]
+
+[node name="Main" type="Node3D" unique_id=1864516631]
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=99991616]
+transform = Transform3D(1, 0, 0, 0, 0.9848077, 0.17364818, 0, -0.17364818, 0.9848077, 0, 1.4, 3)
+current = true
+fov = 120.0
+
+[node name="Sketchfab_Scene3" parent="." unique_id=1229358717 instance=ExtResource("2_uu6xs")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.1, 0)
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=491634206]
+transform = Transform3D(0.70710677, 0.49999997, -0.49999997, 0, 0.70710677, 0.70710677, 0.70710677, -0.49999997, 0.49999997, 0, 0, 0)

@@ -4,10 +4,11 @@ import sys
 import os
 import faulthandler
 import warnings
+import signal
 from datetime import datetime
 from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen
 from PySide6.QtGui import QIcon, QPixmap
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from core.logging_config import configure_logging
 from core.paths import project_path, resource_path
 from ui.main_window import MainWindow
@@ -144,6 +145,27 @@ def main():
             window.hide()
         else:
             window.show()
+
+        if is_edge_mode:
+            shutdown_state = {"requested": False}
+
+            def _request_graceful_shutdown(signum, _frame):
+                if shutdown_state["requested"]:
+                    return
+                shutdown_state["requested"] = True
+                print(f"Received signal {signum}; shutting down edge runtime gracefully...")
+
+                def _graceful_stop():
+                    try:
+                        window._shutdown_runtime()
+                    except Exception as exc:
+                        print(f"Edge graceful shutdown error: {exc}")
+                    app.quit()
+
+                QTimer.singleShot(0, _graceful_stop)
+
+            signal.signal(signal.SIGTERM, _request_graceful_shutdown)
+            signal.signal(signal.SIGINT, _request_graceful_shutdown)
 
         if 'splash' in locals():
             if not is_edge_mode:

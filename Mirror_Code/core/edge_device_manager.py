@@ -108,6 +108,7 @@ class EdgeDeviceManager:
         password,
         remote_dir="~/smart_mirror_edge",
         display=":0",
+        camera_index=0,
         install_deps=False,
         setup_postgres=True,
         db_backend="postgres",
@@ -174,6 +175,11 @@ class EdgeDeviceManager:
             escaped_remote_dir = self._remote_path_expr(remote_dir)
             escaped_remote_bundle = shlex.quote(remote_bundle)
             escaped_display = shlex.quote(display)
+            try:
+                camera_index = max(0, int(camera_index))
+            except (TypeError, ValueError):
+                camera_index = 0
+            escaped_camera_index = shlex.quote(str(camera_index))
             force_reinstall_deps = "1" if install_deps else "0"
             remote_script = (
                 f"set -e; "
@@ -261,6 +267,7 @@ class EdgeDeviceManager:
                 f"SMART_MIRROR_GYM_ID={escaped_gym_id} "
                 f"SMART_MIRROR_MAIN_SYSTEM_ID={escaped_main_system_id} "
                 f"SMART_MIRROR_NODE_ROLE=EDGE "
+                f"SMART_MIRROR_EDGE_CAMERA_INDEX={escaped_camera_index} "
                 f"PYTHONFAULTHANDLER=1 PYTHONUNBUFFERED=1 "
                 f"$PY_BIN app.py >> \"$RUNTIME_LOG\" 2>&1 < /dev/null & "
                 f"LAUNCH_STATUS=$?; "
@@ -394,8 +401,18 @@ class EdgeDeviceManager:
                 "RUNTIME_PID=$(cat edge_app.pid 2>/dev/null || true); "
                 "fi; "
                 "if [ -n \"$RUNTIME_PID\" ] && kill -0 \"$RUNTIME_PID\" 2>/dev/null; then "
-                "kill \"$RUNTIME_PID\" 2>/dev/null || true; "
-                "sleep 1; "
+                "kill -TERM \"$RUNTIME_PID\" 2>/dev/null || true; "
+                "for _ in 1 2 3 4 5 6 7 8 9 10; do "
+                "if ! kill -0 \"$RUNTIME_PID\" 2>/dev/null; then break; fi; "
+                "sleep 0.5; "
+                "done; "
+                "if kill -0 \"$RUNTIME_PID\" 2>/dev/null; then "
+                "kill -INT \"$RUNTIME_PID\" 2>/dev/null || true; "
+                "for _ in 1 2 3 4 5 6; do "
+                "if ! kill -0 \"$RUNTIME_PID\" 2>/dev/null; then break; fi; "
+                "sleep 0.5; "
+                "done; "
+                "fi; "
                 "if kill -0 \"$RUNTIME_PID\" 2>/dev/null; then "
                 "kill -9 \"$RUNTIME_PID\" 2>/dev/null || true; "
                 "fi; "

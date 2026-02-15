@@ -70,6 +70,15 @@ def resolve_edge_pg_user(edge):
     return getpass.getuser()
 
 
+def resolve_edge_camera_index(edge, fallback=0):
+    raw_value = edge.get("camera_index", fallback) if isinstance(edge, dict) else fallback
+    try:
+        index = int(raw_value)
+    except (TypeError, ValueError):
+        index = fallback
+    return max(0, index)
+
+
 def detect_available_cameras(max_cameras=10):
     available_cams = []
     for i in range(max_cameras):
@@ -112,6 +121,7 @@ class EdgeDeployWorker(QThread):
                 password=password,
                 remote_dir=remote_dir,
                 display=display,
+                camera_index=resolve_edge_camera_index(edge),
                 install_deps=install_deps,
                 setup_postgres=bool(edge.get("setup_postgres", False)),
                 db_backend=edge.get("db_backend", "postgres"),
@@ -175,6 +185,35 @@ class EdgeStopWorker(QThread):
                 self.progress_signal.emit(f"Edge runtime stop failed for {ip}.")
 
         self.finished_signal.emit({"success_ips": success_ips, "failures": failures})
+
+
+class SyncPipelineWorker(QThread):
+    progress_signal = Signal(str)
+    finished_signal = Signal(object)
+
+    def __init__(self, pull_callable, push_callable, parent=None):
+        super().__init__(parent)
+        self._pull_callable = pull_callable
+        self._push_callable = push_callable
+
+    def run(self):
+        result = {
+            "pulled": 0,
+            "synced": 0,
+            "error": "",
+        }
+        try:
+            if self.isInterruptionRequested():
+                self.finished_signal.emit(result)
+                return
+            result["pulled"] = int(self._pull_callable(self.progress_signal.emit) or 0)
+            if self.isInterruptionRequested():
+                self.finished_signal.emit(result)
+                return
+            result["synced"] = int(self._push_callable(self.progress_signal.emit) or 0)
+        except Exception as exc:
+            result["error"] = str(exc)
+        self.finished_signal.emit(result)
 
 
 class SmartMirrorWindow(QMainWindow):
@@ -465,6 +504,8 @@ class MainWindow(QMainWindow):
         self.edge_devices = []
         self._edge_deploy_worker = None
         self._edge_stop_worker = None
+        self._sync_pipeline_worker = None
+        self._sync_force_transfer_pending = False
         self.is_edge_mode = os.environ.get("SMART_MIRROR_EDGE_MODE", "0") == "1"
         self.edge_allow_close = os.environ.get("SMART_MIRROR_EDGE_ALLOW_CLOSE", "0") == "1"
         self._is_shutting_down = False
@@ -661,6 +702,7 @@ class MainWindow(QMainWindow):
                         "password": item.get("password", ""),
                         "remote_dir": item.get("remote_dir", "~/smart_mirror_edge"),
                         "display": item.get("display", ":0"),
+                        "camera_index": resolve_edge_camera_index(item),
                         "install_deps": bool(item.get("install_deps", False)),
                         "setup_postgres": bool(item.get("setup_postgres", True)),
                         "db_backend": item.get("db_backend", "postgres"),
@@ -684,9 +726,15 @@ class MainWindow(QMainWindow):
             self.aruco_dict_type = ArucoDetector.normalize_dict_type(
                 data.get("aruco_dict_type", "DICT_5X5_100")
             )
+            edge_camera_index_override = (
+                self._edge_camera_index_override() if self.is_edge_mode else None
+            )
             exercises = data.get("exercises", [])
             for ex in exercises:
-                camera_index = ex["camera_index"]
+                if edge_camera_index_override is not None:
+                    camera_index = edge_camera_index_override
+                else:
+                    camera_index = int(ex.get("camera_index", 0))
                 exercise = ex["exercise"]
                 user_name = ex.get("user_name", None)
                 self.add_exercise_page(
@@ -732,14 +780,31 @@ class MainWindow(QMainWindow):
         if not exercise_config:
             return
         default_exercise = list(exercise_config.keys())[0]
+        default_camera_index = 0
+        edge_camera_index_override = self._edge_camera_index_override()
+        if edge_camera_index_override is not None:
+            default_camera_index = edge_camera_index_override
         self.add_exercise_page(
-            camera_index=0,
+            camera_index=default_camera_index,
             exercise=default_exercise,
             user_name=None,
             start_immediately=False,
             aruco_dict_type=self.aruco_dict_type,
         )
         self.save_config()
+
+    def _edge_camera_index_override(self):
+        raw_value = (
+            os.getenv("SMART_MIRROR_EDGE_CAMERA_INDEX", "")
+            or os.getenv("SMART_MIRROR_CAMERA_INDEX", "")
+        ).strip()
+        if not raw_value:
+            return None
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            logging.warning("Invalid SMART_MIRROR_EDGE_CAMERA_INDEX value: %s", raw_value)
+            return None
 
     def add_exercise_dialog(self):
         available_cams = detect_available_cameras(max_cameras=10)
@@ -772,6 +837,7 @@ class MainWindow(QMainWindow):
         password = selection["password"]
         remote_dir = selection["remote_dir"]
         display = selection["display"]
+        camera_index = int(selection.get("camera_index", 0))
         install_deps = selection["install_deps"]
         setup_postgres = True
 
@@ -785,6 +851,7 @@ class MainWindow(QMainWindow):
             password=password,
             remote_dir=remote_dir,
             display=display,
+            camera_index=camera_index,
             install_deps=install_deps,
             setup_postgres=setup_postgres,
         )
@@ -793,6 +860,7 @@ class MainWindow(QMainWindow):
             f"Edge device added.\n\n"
             f"Host: {device.hostname or 'unknown'}\n"
             f"IP: {device.ip}\n"
+            f"Camera index: {camera_index}\n"
             f"Edge DB mode: postgres\n"
             f"Code deploy/start will run automatically on Start All."
         )
@@ -807,6 +875,7 @@ class MainWindow(QMainWindow):
         remote_dir,
         display,
         install_deps,
+        camera_index=0,
         setup_postgres=False,
     ):
         setup_postgres = True
@@ -830,6 +899,10 @@ class MainWindow(QMainWindow):
         )
         # Keep pg_password optional in config; runtime falls back to admin default.
         effective_pg_password = existing_pg_password or "admin"
+        effective_camera_index = resolve_edge_camera_index(
+            {"camera_index": camera_index},
+            fallback=resolve_edge_camera_index(existing_record or {}, fallback=0),
+        )
 
         record = {
             "ip": device.ip,
@@ -840,6 +913,7 @@ class MainWindow(QMainWindow):
             "password": password,
             "remote_dir": remote_dir,
             "display": display,
+            "camera_index": effective_camera_index,
             "install_deps": bool(install_deps),
             "setup_postgres": True,
             "db_backend": "postgres",
@@ -1062,6 +1136,10 @@ class MainWindow(QMainWindow):
         self.stop_edge_button.setEnabled(True)
         self.stop_all_edge_button.setEnabled(True)
 
+        # Immediately pull any just-flushed edge data after stop operations.
+        if not self._is_shutting_down and self._can_run_transfer_pipeline():
+            self._start_background_transfer_sync(force_transfer=True)
+
     def add_member_dialog(self):
         dialog = AddMemberDialog(self.db_handler, self)
         if dialog.exec() == QDialog.Accepted:
@@ -1151,7 +1229,12 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_worker_data_updated(self):
-        self.sync_local_data_to_postgres(force_transfer=True)
+        self.sync_local_data_to_postgres(force_transfer=self._can_run_transfer_pipeline())
+
+    def _can_run_transfer_pipeline(self):
+        if self.is_edge_mode:
+            return False
+        return (self.system_config.get("node_role") or "MAIN").upper() == "MAIN"
 
     def prompt_new_user_name(self, exercise_page):
         if self.is_edge_mode:
@@ -1354,9 +1437,7 @@ class MainWindow(QMainWindow):
             logging.debug("Counters updated reps=%s sets=%s", reps, sets)
 
     def _should_run_transfer_sync(self):
-        if self.is_edge_mode:
-            return False
-        if (self.system_config.get("node_role") or "MAIN").upper() != "MAIN":
+        if not self._can_run_transfer_pipeline():
             return False
         now = time.monotonic()
         if (now - self._last_sync_transfer_at) < self._sync_transfer_min_gap_sec:
@@ -1378,7 +1459,8 @@ class MainWindow(QMainWindow):
             pass
         return ip in local_ips
 
-    def _pull_edge_data_to_main(self):
+    def _pull_edge_data_to_main(self, progress_callback=None):
+        progress_callback = progress_callback or self.update_status
         pulled_total = 0
 
         for edge in self.edge_devices:
@@ -1401,10 +1483,10 @@ class MainWindow(QMainWindow):
                 pg_password=resolve_edge_pg_password(edge),
                 pg_host=edge.get("pg_host", "localhost"),
                 pg_port=edge.get("pg_port", "5432"),
-                progress_callback=self.update_status,
+                progress_callback=progress_callback,
             )
             if not ok:
-                self.update_status(f"Edge pull failed for {ip}: {details}")
+                progress_callback(f"Edge pull failed for {ip}: {details}")
                 continue
             if not records:
                 continue
@@ -1416,7 +1498,7 @@ class MainWindow(QMainWindow):
             )
             pulled_total += applied
             if applied < len(records):
-                self.update_status(
+                progress_callback(
                     f"Edge {ip}: applied {applied}/{len(records)} record(s); unresolved records will retry."
                 )
             if applied > 0 and applied_record_ids:
@@ -1433,28 +1515,71 @@ class MainWindow(QMainWindow):
                     pg_password=resolve_edge_pg_password(edge),
                     pg_host=edge.get("pg_host", "localhost"),
                     pg_port=edge.get("pg_port", "5432"),
-                    progress_callback=self.update_status,
+                    progress_callback=progress_callback,
                 )
                 if not ack_ok:
-                    self.update_status(f"Edge ACK failed for {ip}: {ack_details}")
+                    progress_callback(f"Edge ACK failed for {ip}: {ack_details}")
                 else:
-                    self.update_status(f"Edge {ip}: pulled and ACKed {applied} record(s).")
+                    progress_callback(f"Edge {ip}: pulled and ACKed {applied} record(s).")
         return pulled_total
 
     def _pull_local_edge_data_to_main(self, limit=500):
         _ = limit
         return 0
 
-    def _sync_main_to_server(self):
+    def _sync_main_to_server(self, status_callback=None):
+        status_callback = status_callback or self.update_status
         synced = 0
         if not hasattr(self, "server_sync_client"):
             return synced
         ok, message, synced = self.server_sync_client.push_pending(limit=500)
         if message:
-            self.update_status(message)
+            status_callback(message)
         if not ok:
             logging.warning("Main->Server sync issue: %s", message)
         return synced
+
+    def _start_background_transfer_sync(self, force_transfer=False):
+        if self._is_shutting_down:
+            return
+
+        if not self._can_run_transfer_pipeline():
+            return
+
+        if not (force_transfer or self._should_run_transfer_sync()):
+            return
+
+        if self._sync_pipeline_worker and self._sync_pipeline_worker.isRunning():
+            if force_transfer:
+                self._sync_force_transfer_pending = True
+            return
+
+        self._sync_pipeline_worker = SyncPipelineWorker(
+            pull_callable=lambda progress_cb: self._pull_edge_data_to_main(progress_callback=progress_cb),
+            push_callable=lambda progress_cb: self._sync_main_to_server(status_callback=progress_cb),
+            parent=self,
+        )
+        self._sync_pipeline_worker.progress_signal.connect(self.update_status)
+        self._sync_pipeline_worker.finished_signal.connect(self._on_background_transfer_finished)
+        self._sync_pipeline_worker.start()
+
+    @Slot(object)
+    def _on_background_transfer_finished(self, payload):
+        payload = payload or {}
+        error = (payload.get("error") or "").strip()
+        if error:
+            logging.warning("Background transfer sync failed: %s", error)
+            self.update_status(f"Background sync error: {error}")
+
+        rerun_forced = self._sync_force_transfer_pending
+        self._sync_force_transfer_pending = False
+
+        if self._sync_pipeline_worker:
+            self._sync_pipeline_worker.deleteLater()
+            self._sync_pipeline_worker = None
+
+        if rerun_forced and not self._is_shutting_down:
+            QTimer.singleShot(0, lambda: self._start_background_transfer_sync(force_transfer=True))
 
     def sync_local_data_to_postgres(self, force_transfer=False):
         if self._is_shutting_down:
@@ -1464,11 +1589,9 @@ class MainWindow(QMainWindow):
             self.home_page.load_recent_activities()
             self.member_list_page.load_members()
 
-            if force_transfer or self._should_run_transfer_sync():
-                if force_transfer:
-                    self._last_sync_transfer_at = time.monotonic()
-                self._pull_edge_data_to_main()
-                self._sync_main_to_server()
+            if force_transfer:
+                self._last_sync_transfer_at = time.monotonic()
+            self._start_background_transfer_sync(force_transfer=force_transfer)
         except Exception as exc:
             logging.error("Dashboard refresh failed: %s", exc)
 
@@ -1476,6 +1599,50 @@ class MainWindow(QMainWindow):
         if self._is_shutting_down:
             return
         self._is_shutting_down = True
+
+        def _stop_edges_for_shutdown():
+            if self.is_edge_mode:
+                return
+
+            edge_payload = [dict(edge) for edge in self.edge_devices if (edge.get("ip") or "").strip()]
+            if not edge_payload:
+                return
+
+            self.status_bar.showMessage("Stopping edge runtime(s) before exit...")
+            failures = []
+
+            for edge in edge_payload:
+                ip = (edge.get("ip") or "").strip()
+                username = (edge.get("username") or "").strip()
+                password = (edge.get("password") or "").strip()
+                remote_dir = (edge.get("remote_dir") or "~/smart_mirror_edge").strip()
+
+                if not ip:
+                    continue
+                if not username or not password:
+                    failures.append(f"{ip}: Missing SSH username/password.")
+                    continue
+
+                self.update_status(f"Stopping edge runtime on {ip}...")
+                result = self.edge_device_manager.stop_runtime(
+                    ip=ip,
+                    username=username,
+                    password=password,
+                    remote_dir=remote_dir,
+                    progress_callback=self.update_status,
+                )
+                if not result.success:
+                    details = f" ({result.details})" if result.details else ""
+                    failures.append(f"{ip}: {result.message}{details}")
+
+            if failures:
+                logging.warning("Edge shutdown failures: %s", " | ".join(failures))
+                self.status_bar.showMessage(
+                    f"App closed with {len(failures)} edge stop failure(s). Check logs.",
+                    10000,
+                )
+            else:
+                self.status_bar.showMessage("All edge runtimes stopped.", 5000)
 
         if self.sync_timer and self.sync_timer.isActive():
             self.sync_timer.stop()
@@ -1486,6 +1653,11 @@ class MainWindow(QMainWindow):
         if self._edge_stop_worker and self._edge_stop_worker.isRunning():
             self._edge_stop_worker.requestInterruption()
             self._edge_stop_worker.wait(3000)
+        if self._sync_pipeline_worker and self._sync_pipeline_worker.isRunning():
+            self._sync_pipeline_worker.requestInterruption()
+            self._sync_pipeline_worker.wait(3000)
+
+        _stop_edges_for_shutdown()
 
         for (page, _, _, _) in self.exercise_pages[:]:
             self._disconnect_mirror_feed(page)
@@ -1494,8 +1666,9 @@ class MainWindow(QMainWindow):
 
         # Final dashboard sync while DB is still open.
         try:
-            self._pull_edge_data_to_main()
-            self._sync_main_to_server()
+            if self._can_run_transfer_pipeline():
+                self._pull_edge_data_to_main()
+                self._sync_main_to_server()
             self.home_page.refresh_summary()
             self.home_page.load_recent_activities()
             self.member_list_page.load_members()

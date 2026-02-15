@@ -8,7 +8,7 @@
     },
     "server_sync": {
         "enabled": true,
-        "server_url": "http://127.0.0.1:8000",
+        "server_url": "http://35.206.90.167:8000",
         "ingest_endpoint": "/api/ingest/main-batch/",
         "api_key": "local-test-key",
         "gym_id": "36a67fbd-90e3-4aa2-886e-0a8b1b2bd996",
@@ -32,6 +32,7 @@
             "password": "LAKSHYA@3738",
             "remote_dir": "~/smart_mirror_edge",
             "display": ":1",
+            "camera_index": 0,
             "install_deps": false,
             "setup_postgres": true,
             "db_backend": "postgres",
@@ -43,7 +44,7 @@
             "mirror_id": "cb8a8e05-14ef-418a-826e-6b617c5edc66",
             "gym_id": "36a67fbd-90e3-4aa2-886e-0a8b1b2bd996",
             "main_system_id": "ac48af70-bc2b-43b6-8dad-db987b669276",
-            "last_deployed_at": "2026-02-09T19:05:10.906316"
+            "last_deployed_at": "2026-02-10T20:36:28.009379"
         }
     ]
 }

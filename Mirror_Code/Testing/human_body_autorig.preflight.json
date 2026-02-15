@@ -1,0 +1,26 @@
+{
+  "asset": "/Users/lakshyasharan/Desktop/Transferred/Transfer/Gym Startup/Modular_code/Modular_final/FINAL FINAL_BTP/BTP_New-final/Mirror_Code/Testing/human_body_autorig.glb",
+  "pass": true,
+  "errors": [],
+  "warnings": [],
+  "stats": {
+    "nodes": 24,
+    "meshes": 1,
+    "skins": 1,
+    "materials": 1,
+    "triangles_estimate": 33240,
+    "mesh_node_index": 4,
+    "skin_index": 0,
+    "joint_count": 19,
+    "skeleton_node": 5,
+    "has_inverse_bind_matrices": true,
+    "vertex_count": 18057,
+    "joints_count": 18057,
+    "weights_count": 18057,
+    "joint_index_min": 0,
+    "joint_index_max": 18,
+    "weight_sum_min": 0.9999998211860657,
+    "weight_sum_max": 1.000000238418579,
+    "weight_nonzero_min": 4
+  }
+}

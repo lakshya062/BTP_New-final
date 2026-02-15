@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
 )
 
@@ -55,6 +56,12 @@ class AddDeviceDialog(QDialog):
 
         self.display_input = QLineEdit(":0")
         form_layout.addRow("Remote DISPLAY:", self.display_input)
+
+        self.camera_index_input = QSpinBox()
+        self.camera_index_input.setRange(0, 99)
+        self.camera_index_input.setValue(0)
+        self.camera_index_input.setToolTip("OpenCV camera index on edge device (e.g. 0, 1, 2).")
+        form_layout.addRow("Edge Camera Index:", self.camera_index_input)
 
         self.manual_ip_input = QLineEdit()
         self.manual_ip_input.setPlaceholderText("Optional manual edge IP, e.g. 192.168.1.42")
@@ -199,6 +206,7 @@ class AddDeviceDialog(QDialog):
             "password": self.password_input.text().strip(),
             "remote_dir": self.remote_dir_input.text().strip(),
             "display": self.display_input.text().strip(),
+            "camera_index": int(self.camera_index_input.value()),
             "install_deps": self.install_deps_checkbox.isChecked(),
             "setup_postgres": True,
         }

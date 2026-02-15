@@ -1,0 +1,8 @@
+[gd_scene format=3 uid="uid://ca53x3g8b4djr"]
+
+[ext_resource type="PackedScene" uid="uid://bqbun16h1gxdv" path="res://human_body_autorig.glb" id="1_ug3l5"]
+
+[node name="Sketchfab_Scene" unique_id=150606298 instance=ExtResource("1_ug3l5")]
+
+[node name="Skeleton3D" parent="Sketchfab_model/root/GLTF_SceneRootNode/BaseSpiderMan_0" parent_id_path=PackedInt32Array(1273302577) index="0" unique_id=1630564472]
+transform = Transform3D(0.99999994, 0, 0, 0, 0.99999994, 0, 0, 0, 0.99999994, 0, 0, 0)
