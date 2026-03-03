@@ -47,6 +47,51 @@ exercise_config = {
             'min_valid_arms': 1,
         },
     },
+    'deadlift': {
+        'angles': {
+            'left_hip': [mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.LEFT_HIP, mp_pose.PoseLandmark.LEFT_KNEE],
+            'right_hip': [mp_pose.PoseLandmark.RIGHT_SHOULDER, mp_pose.PoseLandmark.RIGHT_HIP, mp_pose.PoseLandmark.RIGHT_KNEE],
+            'left_knee': [mp_pose.PoseLandmark.LEFT_HIP, mp_pose.PoseLandmark.LEFT_KNEE, mp_pose.PoseLandmark.LEFT_ANKLE],
+            'right_knee': [mp_pose.PoseLandmark.RIGHT_HIP, mp_pose.PoseLandmark.RIGHT_KNEE, mp_pose.PoseLandmark.RIGHT_ANKLE],
+        },
+        'rep_angle_keys': ['left_hip', 'right_hip'],
+        'down_range': (158, 180),   # Standing lockout
+        'up_range': (78, 122),      # Bottom hinge
+        'reps_per_set': 8,
+        'bend_detection': False,
+        'form_gate': {
+            # Side-angle enforcement.
+            'front_shoulder_to_torso_ratio': 0.78,
+            'front_hip_to_torso_ratio': 0.62,
+            'max_centered_nose_offset_ratio': 0.20,
+            'max_front_shoulder_depth_delta': 0.028,
+            'max_front_hip_depth_delta': 0.024,
+            'min_side_shoulder_depth_delta': 0.040,
+            'min_side_hip_depth_delta': 0.032,
+            'max_side_shoulder_to_torso_ratio': 0.74,
+            'required_side_pose_frames': 6,
+            'startup_required_side_pose_frames': 3,
+            # Start position: tall lockout before first rep.
+            'startup_stable_frames_required': 12,
+            'startup_down_range': (150, 180),
+            # Tracking quality and movement constraints.
+            'min_side_visibility': 0.42,
+            'max_tracking_torso_lean': 78,
+            'min_tracking_hip_angle': 60,
+            'min_tracking_knee_angle': 65,
+            # Top lockout validation.
+            'top_hip_angle_min': 158,
+            'top_knee_angle_min': 154,
+            'max_top_torso_lean': 30,
+            'startup_top_hip_angle_min': 150,
+            'startup_top_knee_angle_min': 148,
+            'startup_max_top_torso_lean': 34,
+            # Bottom hinge validation.
+            'bottom_hip_angle_range': (74, 126),
+            'bottom_knee_angle_range': (78, 145),
+            'bottom_torso_lean_range': (28, 74),
+        },
+    },
     'seated_shoulder_press': {
         'angles': {
             'left_elbow': [mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.LEFT_ELBOW, mp_pose.PoseLandmark.LEFT_WRIST],

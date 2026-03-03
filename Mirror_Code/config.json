@@ -8,7 +8,7 @@
     },
     "server_sync": {
         "enabled": true,
-        "server_url": "http://35.206.90.167:8000",
+        "server_url": "http://35.209.207.47:8000",
         "ingest_endpoint": "/api/ingest/main-batch/",
         "api_key": "local-test-key",
         "gym_id": "36a67fbd-90e3-4aa2-886e-0a8b1b2bd996",

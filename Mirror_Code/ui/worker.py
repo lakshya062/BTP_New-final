@@ -281,6 +281,8 @@ class ExerciseWorker(QThread):
             right_shoulder = landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
             left_elbow = landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value]
             right_elbow = landmarks[mp_pose.PoseLandmark.RIGHT_ELBOW.value]
+            left_knee = landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value]
+            right_knee = landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value]
             left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
             right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value]
 
@@ -292,7 +294,13 @@ class ExerciseWorker(QThread):
             arm_visibility_threshold = max(0.2, self.pose_visibility_threshold - 0.15)
             left_elbow_visible = getattr(left_elbow, "visibility", 0.0) >= arm_visibility_threshold
             right_elbow_visible = getattr(right_elbow, "visibility", 0.0) >= arm_visibility_threshold
-            if not (left_elbow_visible or right_elbow_visible):
+            if self.exercise_choice == "deadlift":
+                leg_visibility_threshold = max(0.2, self.pose_visibility_threshold - 0.15)
+                left_knee_visible = getattr(left_knee, "visibility", 0.0) >= leg_visibility_threshold
+                right_knee_visible = getattr(right_knee, "visibility", 0.0) >= leg_visibility_threshold
+                if not (left_knee_visible or right_knee_visible):
+                    return False
+            elif not (left_elbow_visible or right_elbow_visible):
                 return False
 
             shoulder_width = hypot(
@@ -385,10 +393,16 @@ class ExerciseWorker(QThread):
         range_message = None
         if up_range_miss:
             range_marker = (sets_done, reps, "up")
-            range_message = "Go higher. Reach the top range before lowering."
+            if self.exercise_choice == "deadlift":
+                range_message = "Go deeper into the hinge before standing up."
+            else:
+                range_message = "Go higher. Reach the top range before lowering."
         elif down_range_miss:
             range_marker = (sets_done, reps, "down")
-            range_message = "Lower fully. Reach the down range before next rep."
+            if self.exercise_choice == "deadlift":
+                range_message = "Stand tall at lockout before the next rep."
+            else:
+                range_message = "Lower fully. Reach the down range before next rep."
 
         if range_marker is not None:
             if range_marker != self._audio_last_range_marker and self._emit_audio_message(
@@ -448,11 +462,16 @@ class ExerciseWorker(QThread):
         down_range_miss=False,
         stagnant_seconds=0.0,
     ):
+        is_deadlift = self.exercise_choice == "deadlift"
         if any("Warning" in text for text in feedback_texts):
             return "Reset your posture first, then we go again with control."
         if up_range_miss:
+            if is_deadlift:
+                return "You are close. Hinge deeper with control before driving up."
             return "You are close. Lift a little higher and squeeze at the top."
         if down_range_miss:
+            if is_deadlift:
+                return "Strong pull. Finish taller at lockout before the next rep."
             return "Nice effort. Lower all the way down, then start the next curl."
         if "Set complete!" in feedback_texts:
             return "Great set. Take two deep breaths and get ready for the next round."
@@ -463,7 +482,11 @@ class ExerciseWorker(QThread):
             if stagnant_seconds >= 14:
                 lines = [
                     "You are not done yet. One clean rep breaks this plateau.",
-                    "Stay with me. Elbows tight, breathe out, and finish this rep.",
+                    (
+                        "Stay with me. Brace your core, drive through your heels, and finish this rep."
+                        if is_deadlift
+                        else "Stay with me. Elbows tight, breathe out, and finish this rep."
+                    ),
                     "Tough moment right now. Slow down, reset, and drive through.",
                 ]
                 return lines[int(stagnant_seconds // 4) % len(lines)]
@@ -476,6 +499,8 @@ class ExerciseWorker(QThread):
                 return lines[int(stagnant_seconds // 3) % len(lines)]
 
         if stable_start_detected and sets_done == 0 and reps == 0:
+            if is_deadlift:
+                return "Start position locked. Hinge back smoothly, then stand tall at lockout."
             return "Start position locked. Curl up with intent and return with control."
         if sets_done > 0 and reps == 0:
             return "Strong previous set. Stay composed and attack this next one."
@@ -489,8 +514,12 @@ class ExerciseWorker(QThread):
             return "Rhythm looks good. Stack clean reps one by one."
         if reps > 0:
             if rep_state == 1:
+                if is_deadlift:
+                    return "Push the floor away and drive hips forward to stand tall."
                 return "Drive up through the curl. Elbows stay pinned."
             if rep_state == 2:
+                if is_deadlift:
+                    return "Control the hinge down. Keep the spine neutral and lats tight."
                 return "Control the way down. Earn the full range."
             return "Good tempo. Stay smooth and keep tension."
         if status_hint:
@@ -592,8 +621,10 @@ class ExerciseWorker(QThread):
             "rep_state": rep_state,
             "up_range_miss": up_range_miss,
             "down_range_miss": down_range_miss,
+            "up_range_label": "BOTTOM" if self.exercise_choice == "deadlift" else "UP",
+            "down_range_label": "LOCKOUT" if self.exercise_choice == "deadlift" else "DOWN",
             "show_range_bars": (
-                self.exercise_choice == "bicep_curl"
+                self.exercise_choice in {"bicep_curl", "deadlift"}
                 and stable_start_detected
                 and rep_angle is not None
                 and up_range is not None
@@ -795,6 +826,8 @@ class ExerciseWorker(QThread):
             down_hit = down_min <= rep_angle <= down_max
             up_miss = bool(overlay_data.get("up_range_miss", False))
             down_miss = bool(overlay_data.get("down_range_miss", False))
+            up_range_label = str(overlay_data.get("up_range_label", "UP"))
+            down_range_label = str(overlay_data.get("down_range_label", "DOWN"))
 
             def draw_range_bar(label, y, progress, target_min, target_max, in_target, expected_now, miss_now):
                 draw_translucent_panel(
@@ -864,7 +897,7 @@ class ExerciseWorker(QThread):
                 )
 
             draw_range_bar(
-                "UP",
+                up_range_label,
                 up_bar_y,
                 up_progress,
                 up_min,
@@ -874,7 +907,7 @@ class ExerciseWorker(QThread):
                 up_miss,
             )
             draw_range_bar(
-                "DOWN",
+                down_range_label,
                 down_bar_y,
                 down_progress,
                 down_min,

@@ -91,7 +91,7 @@ def _resolve_identity(distances, name_to_indices, tolerance, min_margin):
     return best_name
 
 
-def process_frame(args):
+def process_frame(args): #this can be done on mobiel app.
     """Process a single video frame for face recognition."""
     if len(args) < 3:
         raise ValueError("process_frame expects at least (frame, encodings, names).")
