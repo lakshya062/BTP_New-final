@@ -1,6 +1,7 @@
 # core/aruco_detection.py
 import cv2
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class ArucoDetector:
         """Initialize the Aruco detector with the specified dictionary type."""
         self.detector = None
         self.dict_type = "DICT_5X5_100"
+        self.draw_markers = os.getenv("SMART_MIRROR_DRAW_ARUCO_MARKERS", "0") == "1"
         try:
             raw_type = str(dict_type or "").strip().upper().replace("-", "_").replace(" ", "")
             aruco_key = self.normalize_dict_type(dict_type)
@@ -73,8 +75,8 @@ class ArucoDetector:
                 corners, ids, rejected = cv2.aruco.detectMarkers(
                     gray, self.aruco_dict, parameters=self.aruco_params
                 )
-            # Optionally, draw detected markers for visualization
-            if ids is not None:
+            # Marker drawing is optional; disabled by default to reduce per-frame overhead.
+            if self.draw_markers and ids is not None:
                 cv2.aruco.drawDetectedMarkers(frame, corners, ids)
             return corners, ids, rejected
         except Exception as exc:

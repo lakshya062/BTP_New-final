@@ -3,19 +3,16 @@
 import json
 import os
 import socket
-import sys
 import time
 import uuid
 import getpass
 from PySide6.QtWidgets import (
     QApplication, QMessageBox, QMainWindow, QWidget, QVBoxLayout, QTabWidget,
-    QStatusBar, QPushButton, QHBoxLayout, QComboBox, QInputDialog, QDialog, QLabel, QSizePolicy
+    QStatusBar, QPushButton, QHBoxLayout, QComboBox, QInputDialog, QDialog, QLabel
 )
-from PySide6.QtGui import QFont, QIcon, QGuiApplication, QPixmap, QImage
-from PySide6.QtCore import Qt, QTimer, Slot, QSize, QThread, Signal
-from screeninfo import get_monitors
+from PySide6.QtGui import QFont, QIcon, QGuiApplication
+from PySide6.QtCore import QTimer, Slot, QSize
 
-import cv2
 import logging
 from datetime import datetime
 from functools import partial
@@ -36,349 +33,14 @@ from ui.add_device_dialog import AddDeviceDialog
 from ui.add_member_dialog import AddMemberDialog
 from ui.home_page import HomePage
 from ui.register_user_dialog import RegisterUserDialog
-
-
-def resolve_edge_pg_password(edge):
-    pg_password = (edge.get("pg_password") or "").strip()
-    if pg_password:
-        return pg_password
-    backend = (edge.get("db_backend") or "").strip().lower()
-    if backend == "postgres" or bool(edge.get("setup_postgres", False)):
-        configured_default = os.getenv("SMART_MIRROR_DEFAULT_PG_PASSWORD", "admin").strip()
-        return configured_default or "admin"
-    return ""
-
-
-def resolve_edge_pg_user(edge):
-    configured = (edge.get("pg_user") or "").strip()
-    edge_username = (edge.get("username") or "").strip()
-    if configured:
-        local_defaults = {
-            getpass.getuser().strip(),
-            os.getenv("SMART_MIRROR_DEFAULT_PG_USER", "").strip(),
-            os.getenv("PGUSER", "").strip(),
-        }
-        local_defaults.discard("")
-        if edge_username and configured != edge_username and configured in local_defaults:
-            return edge_username
-        return configured
-    if edge_username:
-        return edge_username
-    default_user = os.getenv("SMART_MIRROR_DEFAULT_PG_USER", os.getenv("PGUSER", "")).strip()
-    if default_user:
-        return default_user
-    return getpass.getuser()
-
-
-def resolve_edge_camera_index(edge, fallback=0):
-    raw_value = edge.get("camera_index", fallback) if isinstance(edge, dict) else fallback
-    try:
-        index = int(raw_value)
-    except (TypeError, ValueError):
-        index = fallback
-    return max(0, index)
-
-
-def detect_available_cameras(max_cameras=10):
-    available_cams = []
-    for i in range(max_cameras):
-        cap = cv2.VideoCapture(i)
-        if cap.isOpened():
-            available_cams.append(i)
-        cap.release()
-    return available_cams
-
-
-class EdgeDeployWorker(QThread):
-    progress_signal = Signal(str)
-    finished_signal = Signal(object)
-
-    def __init__(self, edge_device_manager, edge_devices, parent=None):
-        super().__init__(parent)
-        self.edge_device_manager = edge_device_manager
-        self.edge_devices = edge_devices
-
-    def run(self):
-        success_ips = []
-        failures = []
-        for edge in self.edge_devices:
-            if self.isInterruptionRequested():
-                break
-            ip = (edge.get("ip") or "").strip()
-            username = (edge.get("username") or "").strip()
-            password = (edge.get("password") or "").strip()
-            remote_dir = (edge.get("remote_dir") or "~/smart_mirror_edge").strip()
-            display = (edge.get("display") or ":0").strip()
-            install_deps = bool(edge.get("install_deps", False))
-
-            if not ip:
-                continue
-
-            self.progress_signal.emit(f"Deploying edge device {ip}...")
-            result = self.edge_device_manager.deploy_and_launch(
-                ip=ip,
-                username=username,
-                password=password,
-                remote_dir=remote_dir,
-                display=display,
-                camera_index=resolve_edge_camera_index(edge),
-                install_deps=install_deps,
-                setup_postgres=bool(edge.get("setup_postgres", False)),
-                db_backend=edge.get("db_backend", "postgres"),
-                pg_db=edge.get("pg_db", "gym_edge_db"),
-                pg_user=resolve_edge_pg_user(edge),
-                pg_password=resolve_edge_pg_password(edge),
-                pg_host=edge.get("pg_host", "localhost"),
-                pg_port=edge.get("pg_port", "5432"),
-                mirror_id=edge.get("mirror_id", ""),
-                gym_id=edge.get("gym_id", ""),
-                main_system_id=edge.get("main_system_id", ""),
-                progress_callback=self.progress_signal.emit,
-            )
-            if result.success:
-                success_ips.append(ip)
-                self.progress_signal.emit(f"Edge deployment successful for {ip}.")
-            else:
-                details = f" ({result.details})" if result.details else ""
-                failures.append(f"{ip}: {result.message}{details}")
-                self.progress_signal.emit(f"Edge deployment failed for {ip}.")
-
-        self.finished_signal.emit({"success_ips": success_ips, "failures": failures})
-
-
-class EdgeStopWorker(QThread):
-    progress_signal = Signal(str)
-    finished_signal = Signal(object)
-
-    def __init__(self, edge_device_manager, edge_devices, parent=None):
-        super().__init__(parent)
-        self.edge_device_manager = edge_device_manager
-        self.edge_devices = edge_devices
-
-    def run(self):
-        success_ips = []
-        failures = []
-        for edge in self.edge_devices:
-            if self.isInterruptionRequested():
-                break
-            ip = (edge.get("ip") or "").strip()
-            username = (edge.get("username") or "").strip()
-            password = (edge.get("password") or "").strip()
-            remote_dir = (edge.get("remote_dir") or "~/smart_mirror_edge").strip()
-            if not ip:
-                continue
-
-            self.progress_signal.emit(f"Stopping edge runtime on {ip}...")
-            result = self.edge_device_manager.stop_runtime(
-                ip=ip,
-                username=username,
-                password=password,
-                remote_dir=remote_dir,
-                progress_callback=self.progress_signal.emit,
-            )
-            if result.success:
-                success_ips.append(ip)
-                self.progress_signal.emit(f"Edge runtime stop successful for {ip}.")
-            else:
-                details = f" ({result.details})" if result.details else ""
-                failures.append(f"{ip}: {result.message}{details}")
-                self.progress_signal.emit(f"Edge runtime stop failed for {ip}.")
-
-        self.finished_signal.emit({"success_ips": success_ips, "failures": failures})
-
-
-class SyncPipelineWorker(QThread):
-    progress_signal = Signal(str)
-    finished_signal = Signal(object)
-
-    def __init__(self, pull_callable, push_callable, parent=None):
-        super().__init__(parent)
-        self._pull_callable = pull_callable
-        self._push_callable = push_callable
-
-    def run(self):
-        result = {
-            "pulled": 0,
-            "synced": 0,
-            "error": "",
-        }
-        try:
-            if self.isInterruptionRequested():
-                self.finished_signal.emit(result)
-                return
-            result["pulled"] = int(self._pull_callable(self.progress_signal.emit) or 0)
-            if self.isInterruptionRequested():
-                self.finished_signal.emit(result)
-                return
-            result["synced"] = int(self._push_callable(self.progress_signal.emit) or 0)
-        except Exception as exc:
-            result["error"] = str(exc)
-        self.finished_signal.emit(result)
-
-
-class SmartMirrorWindow(QMainWindow):
-    """
-    Window for the HDMI smart mirror display. Frames are centered on a styled
-    background while preserving camera aspect ratio.
-    """
-    def __init__(self):
-        super().__init__()
-        self.setWindowFlag(Qt.FramelessWindowHint)
-
-        self.central_widget = QWidget()
-        self.setCentralWidget(self.central_widget)
-        self.main_layout = QVBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(0, 0, 0, 0)
-        self.main_layout.setSpacing(0)
-
-        self.camera_labels = {}
-        self.setStyleSheet("background-color: #04070d;")
-
-        self.exercise_counters = {}
-
-        self.screen_width = 0
-        self.screen_height = 0
-        self.screen_x = 0
-        self.screen_y = 0
-        self.max_feed_width = 0
-        self.max_feed_height = 0
-
-    def set_displays(self, displays):
-        monitors = get_monitors()
-        if len(monitors) < 2:
-            logging.warning("Only one monitor detected. Falling back to primary display.")
-            chosen_monitor = monitors[0]
-        else:
-            chosen_monitor = monitors[1]
-
-        self.move(chosen_monitor.x, chosen_monitor.y)
-        self.showFullScreen()
-
-        self.screen_width = chosen_monitor.width
-        self.screen_height = chosen_monitor.height
-        self.screen_x = chosen_monitor.x
-        self.screen_y = chosen_monitor.y
-
-        self.max_feed_width = int(self.screen_width * 0.9)
-        self.max_feed_height = int(self.screen_height * 0.86)
-
-    def add_camera_display(self, camera_index, exercise):
-        key = (camera_index, exercise)
-        if key not in self.camera_labels:
-            label = QLabel(self)
-            label.setAlignment(Qt.AlignCenter)
-            label.setStyleSheet("background-color: black;")
-            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            self.camera_labels[key] = label
-            self.main_layout.addWidget(label)
-
-    def remove_camera_display(self, camera_index, exercise):
-        key = (camera_index, exercise)
-        if key in self.camera_labels:
-            lbl = self.camera_labels[key]
-            self.main_layout.removeWidget(lbl)
-            lbl.deleteLater()
-            del self.camera_labels[key]
-
-    def update_counters_for_exercise(self, camera_index, exercise, reps, sets):
-        self.exercise_counters[(camera_index, exercise)] = (reps, sets)
-
-    def _build_background_canvas(self):
-        import numpy as np
-
-        h = max(1, self.screen_height)
-        w = max(1, self.screen_width)
-        canvas = np.zeros((h, w, 3), dtype=np.uint8)
-
-        top_color = np.array([14, 24, 38], dtype=np.float32)
-        bottom_color = np.array([4, 7, 13], dtype=np.float32)
-        blend = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None]
-        gradient_row = (top_color * (1.0 - blend) + bottom_color * blend).astype(np.uint8)
-        canvas[:, :, 0] = gradient_row[:, 0:1]
-        canvas[:, :, 1] = gradient_row[:, 1:2]
-        canvas[:, :, 2] = gradient_row[:, 2:3]
-        return canvas
-
-    def update_thumbnail(self, camera_index, exercise, frame):
-        key = (camera_index, exercise)
-        if key not in self.camera_labels:
-            return
-
-        label = self.camera_labels[key]
-
-        if frame is None or frame.size == 0:
-            return
-
-        canvas = self._build_background_canvas()
-
-        frame_h, frame_w = frame.shape[:2]
-        if frame_h <= 0 or frame_w <= 0:
-            return
-
-        max_w = self.max_feed_width or int(canvas.shape[1] * 0.9)
-        max_h = self.max_feed_height or int(canvas.shape[0] * 0.86)
-        scale = min(max_w / float(frame_w), max_h / float(frame_h))
-        display_w = max(1, int(frame_w * scale))
-        display_h = max(1, int(frame_h * scale))
-        resized_frame = cv2.resize(frame, (display_w, display_h), interpolation=cv2.INTER_AREA)
-
-        x1 = (canvas.shape[1] - display_w) // 2
-        y1 = (canvas.shape[0] - display_h) // 2
-        x2 = x1 + display_w
-        y2 = y1 + display_h
-
-        canvas[y1:y2, x1:x2] = resized_frame
-        cv2.rectangle(
-            canvas,
-            (x1 - 2, y1 - 2),
-            (x2 + 2, y2 + 2),
-            (98, 186, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-        reps, sets_done = self.exercise_counters.get((camera_index, exercise), (0, 0))
-        header_text = (
-            f"cam_{camera_index} | {exercise.replace('_', ' ').title()} | "
-            f"Reps {reps} | Sets {sets_done}"
-        )
-        overlay = canvas.copy()
-        banner_margin = 24
-        banner_h = 56
-        banner_w = min(canvas.shape[1] - 2 * banner_margin, int(canvas.shape[1] * 0.58))
-        cv2.rectangle(
-            overlay,
-            (banner_margin, banner_margin),
-            (banner_margin + banner_w, banner_margin + banner_h),
-            (18, 30, 45),
-            -1,
-        )
-        cv2.addWeighted(overlay, 0.68, canvas, 0.32, 0, canvas)
-        cv2.rectangle(
-            canvas,
-            (banner_margin, banner_margin),
-            (banner_margin + banner_w, banner_margin + banner_h),
-            (92, 166, 236),
-            2,
-        )
-        cv2.putText(
-            canvas,
-            header_text,
-            (banner_margin + 16, banner_margin + 36),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.78,
-            (232, 242, 252),
-            2,
-            cv2.LINE_AA,
-        )
-
-        rgb_image = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qimg = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg)
-
-        label.setPixmap(pix)
+from ui.background_workers import EdgeDeployWorker, EdgeStopWorker, SyncPipelineWorker
+from ui.edge_utils import (
+    detect_available_cameras,
+    resolve_edge_camera_index,
+    resolve_edge_pg_password,
+    resolve_edge_pg_user,
+)
+from ui.smart_mirror_window import SmartMirrorWindow
 
 
 class MainWindow(QMainWindow):
@@ -450,6 +112,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.profile_page, QIcon(resource_path("icons", "profile.png")), "Profile")
         self.tabs.addTab(self.member_list_page, QIcon(resource_path("icons", "members.png")), "Members")
         self.tabs.addTab(self.cameras_overview_page, QIcon(resource_path("icons", "cameras.png")), "Cameras Overview")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.main_layout.addWidget(self.tabs)
 
@@ -528,6 +191,18 @@ class MainWindow(QMainWindow):
         self._last_sync_transfer_at = 0.0
         self._sync_transfer_min_gap_sec = 15.0
         self._pending_registration_profiles = {}
+        self._dashboard_dirty = {
+            "summary": True,
+            "activities": True,
+            "members": True,
+        }
+        self._last_dashboard_refresh_at = 0.0
+        self._dashboard_refresh_min_gap_sec = max(
+            0.2,
+            float(os.getenv("SMART_MIRROR_DASHBOARD_MIN_REFRESH_SEC", "1.0")),
+        )
+        self._last_status_message = ""
+        self._last_status_ts = 0.0
         self.local_camera_as_edge = False
         self.load_config()
         if (self.system_config.get("node_role") or "MAIN").upper() == "MAIN":
@@ -591,6 +266,36 @@ class MainWindow(QMainWindow):
                     logging.info(f"Added {name} to local db from face model.")
                 else:
                     logging.error(f"Failed to add {name} to local db.")
+
+    def _mark_dashboard_dirty(
+        self,
+        summary=False,
+        activities=False,
+        members=False,
+        all_sections=False,
+    ):
+        if all_sections:
+            self._dashboard_dirty["summary"] = True
+            self._dashboard_dirty["activities"] = True
+            self._dashboard_dirty["members"] = True
+            return
+        if summary:
+            self._dashboard_dirty["summary"] = True
+        if activities:
+            self._dashboard_dirty["activities"] = True
+        if members:
+            self._dashboard_dirty["members"] = True
+
+    def _is_members_tab_active(self):
+        return self.tabs.currentWidget() == self.member_list_page
+
+    @Slot(int)
+    def _on_tab_changed(self, _index):
+        if self._is_shutting_down:
+            return
+        if self._is_members_tab_active() and self._dashboard_dirty.get("members"):
+            self.member_list_page.load_members(force=True)
+            self._dashboard_dirty["members"] = False
 
     def _connect_mirror_feed(self, exercise_page, camera_index, exercise):
         if exercise_page in self._mirror_slots:
@@ -808,6 +513,8 @@ class MainWindow(QMainWindow):
 
     def add_exercise_dialog(self):
         available_cams = detect_available_cameras(max_cameras=10)
+        if not available_cams:
+            available_cams = detect_available_cameras(max_cameras=10, force_refresh=True)
         assigned_cams = [cam for (_, cam, _, _) in self.exercise_pages]
         available_cams = [cam for cam in available_cams if cam not in assigned_cams]
 
@@ -1143,8 +850,8 @@ class MainWindow(QMainWindow):
     def add_member_dialog(self):
         dialog = AddMemberDialog(self.db_handler, self)
         if dialog.exec() == QDialog.Accepted:
-            self.member_list_page.load_members()
-            self.home_page.refresh_summary()
+            self._mark_dashboard_dirty(all_sections=True)
+            self.sync_local_data_to_postgres(force_transfer=False)
 
     def add_exercise_page(
         self,
@@ -1229,6 +936,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_worker_data_updated(self):
+        self._mark_dashboard_dirty(summary=True, activities=True, members=True)
         self.sync_local_data_to_postgres(force_transfer=self._can_run_transfer_pipeline())
 
     def _can_run_transfer_pipeline(self):
@@ -1294,8 +1002,8 @@ class MainWindow(QMainWindow):
             return
 
         self.status_bar.showMessage(f"Registered new user: {username}", 5000)
-        self.member_list_page.load_members()
-        self.home_page.refresh_summary()
+        self._mark_dashboard_dirty(all_sections=True)
+        self.sync_local_data_to_postgres(force_transfer=False)
 
     def handle_user_recognized(self, user_info):
         username = user_info.get("username", "Unknown")
@@ -1313,7 +1021,7 @@ class MainWindow(QMainWindow):
                 if success:
                     self.status_bar.showMessage(f"Added {username} to local database.", 5000)
                     self.global_face_recognizer.reload_model()
-                    self.member_list_page.load_members()
+                    self._mark_dashboard_dirty(summary=True, members=True)
                     member = self.db_handler.get_member_info(username) or member_info
                 else:
                     self.status_bar.showMessage(f"Failed to add {username} to local database.", 5000)
@@ -1354,7 +1062,7 @@ class MainWindow(QMainWindow):
             self._start_local_exercises()
 
     def _start_local_exercises(self):
-        available_cams = detect_available_cameras(max_cameras=10)
+        available_cams = detect_available_cameras(max_cameras=10, force_refresh=True)
         missing = []
         for (page, cam_idx, ex, _) in self.exercise_pages:
             if cam_idx not in available_cams:
@@ -1429,8 +1137,19 @@ class MainWindow(QMainWindow):
                 self._connect_overview_feed(page, cam_idx, ex)
 
     def update_status(self, message):
-        logging.info(message)
-        self.status_bar.showMessage(message, 5000)
+        normalized = str(message or "").strip()
+        if not normalized:
+            return
+        now = time.monotonic()
+        if (
+            normalized == self._last_status_message
+            and (now - self._last_status_ts) < 0.9
+        ):
+            return
+        self._last_status_message = normalized
+        self._last_status_ts = now
+        logging.info(normalized)
+        self.status_bar.showMessage(normalized, 5000)
 
     def update_counters(self, reps, sets):
         if self.smart_mirror_window:
@@ -1570,6 +1289,10 @@ class MainWindow(QMainWindow):
         if error:
             logging.warning("Background transfer sync failed: %s", error)
             self.update_status(f"Background sync error: {error}")
+        pulled = int(payload.get("pulled") or 0)
+        if pulled > 0:
+            self._mark_dashboard_dirty(all_sections=True)
+            self.sync_local_data_to_postgres(force_transfer=False)
 
         rerun_forced = self._sync_force_transfer_pending
         self._sync_force_transfer_pending = False
@@ -1585,9 +1308,23 @@ class MainWindow(QMainWindow):
         if self._is_shutting_down:
             return
         try:
-            self.home_page.refresh_summary()
-            self.home_page.load_recent_activities()
-            self.member_list_page.load_members()
+            now = time.monotonic()
+            if (now - self._last_dashboard_refresh_at) < self._dashboard_refresh_min_gap_sec:
+                if force_transfer:
+                    self._last_sync_transfer_at = now
+                self._start_background_transfer_sync(force_transfer=force_transfer)
+                return
+
+            self._last_dashboard_refresh_at = now
+            if self._dashboard_dirty.get("summary", False):
+                self.home_page.refresh_summary()
+                self._dashboard_dirty["summary"] = False
+            if self._dashboard_dirty.get("activities", False):
+                self.home_page.load_recent_activities()
+                self._dashboard_dirty["activities"] = False
+            if self._dashboard_dirty.get("members", False) and self._is_members_tab_active():
+                self.member_list_page.load_members()
+                self._dashboard_dirty["members"] = False
 
             if force_transfer:
                 self._last_sync_transfer_at = time.monotonic()
@@ -1669,14 +1406,20 @@ class MainWindow(QMainWindow):
             if self._can_run_transfer_pipeline():
                 self._pull_edge_data_to_main()
                 self._sync_main_to_server()
+            self._mark_dashboard_dirty(all_sections=True)
             self.home_page.refresh_summary()
             self.home_page.load_recent_activities()
-            self.member_list_page.load_members()
+            self.member_list_page.load_members(force=True)
         except Exception as exc:
             logging.error("Final dashboard refresh failed during shutdown: %s", exc)
 
         self.db_handler.close_connections()
         self.global_face_recognizer.close()
+        if hasattr(self, "server_sync_client") and self.server_sync_client:
+            try:
+                self.server_sync_client.close()
+            except Exception:
+                pass
 
         if self.smart_mirror_window:
             self.smart_mirror_window.close()

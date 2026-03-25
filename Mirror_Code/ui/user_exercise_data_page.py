@@ -12,6 +12,12 @@ class UserExerciseDataPage(QWidget):
         self.db_handler = db_handler
         self.user_id = user_id
         self.embedded = embedded
+        self._exercise_data_cache = []
+        self._columns_sized = {
+            "exercise": False,
+            "session": False,
+            "rep": False,
+        }
 
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
@@ -119,16 +125,23 @@ class UserExerciseDataPage(QWidget):
         # Load Exercises Initially
         self.load_exercises()
 
+    def _load_user_data(self, force_refresh=False):
+        if force_refresh or not self._exercise_data_cache:
+            self._exercise_data_cache = self.db_handler.get_exercise_data_for_user(self.user_id)
+        return self._exercise_data_cache
+
     def load_exercises(self):
         """Load exercises from the database and populate the table."""
         self.exercises_table.setRowCount(0)
-        data = self.db_handler.get_exercise_data_for_user(self.user_id)
+        data = self._load_user_data(force_refresh=True)
         exercises = sorted(list(set([entry['exercise'] for entry in data])))
         for exercise in exercises:
             row = self.exercises_table.rowCount()
             self.exercises_table.insertRow(row)
             self.exercises_table.setItem(row, 0, QTableWidgetItem(exercise))
-        self.exercises_table.resizeColumnsToContents()
+        if not self._columns_sized["exercise"]:
+            self.exercises_table.resizeColumnsToContents()
+            self._columns_sized["exercise"] = True
         self.stacked.setCurrentWidget(self.exercises_page)
 
     @Slot(int, int)
@@ -143,7 +156,7 @@ class UserExerciseDataPage(QWidget):
     def load_sessions(self, exercise):
         """Load sessions for the selected exercise."""
         self.sessions_table.setRowCount(0)
-        data = self.db_handler.get_exercise_data_for_user(self.user_id)
+        data = self._load_user_data()
         sessions = [entry for entry in data if entry['exercise'] == exercise]
         # Sort sessions by timestamp descending
         sessions_sorted = sorted(sessions, key=lambda x: x['timestamp'] if x['timestamp'] else '', reverse=True)
@@ -157,7 +170,9 @@ class UserExerciseDataPage(QWidget):
             self.sessions_table.setItem(row, 3, QTableWidgetItem(session['date'] if session['date'] else ''))
             self.sessions_table.setItem(row, 4, QTableWidgetItem(session['timestamp'] if session['timestamp'] else ''))
             self.sessions_table.setItem(row, 5, QTableWidgetItem(session['id']))
-        self.sessions_table.resizeColumnsToContents()
+        if not self._columns_sized["session"]:
+            self.sessions_table.resizeColumnsToContents()
+            self._columns_sized["session"] = True
 
     @Slot(int, int)
     def on_session_double_clicked(self, row, column):
@@ -171,7 +186,7 @@ class UserExerciseDataPage(QWidget):
     def load_rep_details(self, session_id):
         """Load rep details for the selected session."""
         self.rep_table.setRowCount(0)
-        data = self.db_handler.get_exercise_data_for_user(self.user_id)
+        data = self._load_user_data()
         session = next((entry for entry in data if entry['id'] == session_id), None)
         if not session:
             QMessageBox.warning(self, "Error", "Session data not found.")
@@ -184,7 +199,9 @@ class UserExerciseDataPage(QWidget):
             self.rep_table.setItem(row, 1, QTableWidgetItem(str(rep.get('start_angle', 'N/A'))))
             self.rep_table.setItem(row, 2, QTableWidgetItem(str(rep.get('end_angle', 'N/A'))))
             self.rep_table.setItem(row, 3, QTableWidgetItem(str(rep.get('weight', 'N/A'))))
-        self.rep_table.resizeColumnsToContents()
+        if not self._columns_sized["rep"]:
+            self.rep_table.resizeColumnsToContents()
+            self._columns_sized["rep"] = True
 
     def back_to_exercises(self):
         """Navigate back to the Exercises Page."""

@@ -1,6 +1,7 @@
 # core/logging_config.py
 
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 
 from .paths import project_path
@@ -11,7 +12,8 @@ def configure_logging():
     if root.handlers:
         return
 
-    root.setLevel(logging.INFO)
+    level_name = str(os.getenv("SMART_MIRROR_LOG_LEVEL", "INFO")).upper()
+    root.setLevel(getattr(logging, level_name, logging.INFO))
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 
     file_handler = RotatingFileHandler(

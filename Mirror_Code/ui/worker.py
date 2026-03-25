@@ -15,38 +15,12 @@ from PySide6.QtCore import QThread, Signal
 from core.aruco_detection import ArucoDetector
 from core.pose_analysis import ExerciseAnalyzer
 from core.config import exercise_config
+from ui.coaching import motivation_line, range_miss_message
+from ui.edge_utils import open_camera_capture
+from ui.live_overlay import draw_live_overlay
 
 mp_drawing = mp.solutions.drawing_utils
 mp_pose = mp.solutions.pose
-
-
-def draw_translucent_panel(
-    frame,
-    x,
-    y,
-    width,
-    height,
-    fill_color=(20, 28, 38),
-    border_color=(103, 188, 255),
-    alpha=0.62,
-    border_thickness=2,
-):
-    """Draw a translucent rectangular panel with a border."""
-    x = max(0, int(x))
-    y = max(0, int(y))
-    width = max(1, int(width))
-    height = max(1, int(height))
-
-    x2 = min(frame.shape[1] - 1, x + width)
-    y2 = min(frame.shape[0] - 1, y + height)
-    if x >= x2 or y >= y2:
-        return
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (x, y), (x2, y2), fill_color, -1)
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
-    cv2.rectangle(frame, (x, y), (x2, y2), border_color, border_thickness)
-
 
 class ExerciseWorker(QThread):
     frame_signal = Signal(object)
@@ -183,6 +157,60 @@ class ExerciseWorker(QThread):
         )
         self._analysis_pose_grace_frames_remaining = 0
         self._last_reliable_pose_ts = 0.0
+        self.loop_fps = self._read_float_env(
+            "SMART_MIRROR_WORKER_LOOP_FPS",
+            default=0.0,
+            minimum=0.0,
+        )
+        self.analysis_fps = self._read_float_env(
+            "SMART_MIRROR_WORKER_ANALYSIS_FPS",
+            default=20.0,
+            minimum=1.0,
+        )
+        self.ui_fps = self._read_float_env(
+            "SMART_MIRROR_WORKER_UI_FPS",
+            default=0.0,
+            minimum=0.0,
+        )
+        self.thumbnail_fps = self._read_float_env(
+            "SMART_MIRROR_WORKER_THUMBNAIL_FPS",
+            default=8.0,
+            minimum=1.0,
+        )
+        self.counter_fps = self._read_float_env(
+            "SMART_MIRROR_WORKER_COUNTER_FPS",
+            default=10.0,
+            minimum=1.0,
+        )
+        self._loop_interval_sec = 0.0 if self.loop_fps <= 0 else 1.0 / self.loop_fps
+        self._analysis_interval_sec = 0.0 if self.analysis_fps <= 0 else 1.0 / self.analysis_fps
+        self._ui_interval_sec = 0.0 if self.ui_fps <= 0 else 1.0 / self.ui_fps
+        self._thumbnail_interval_sec = (
+            0.0 if self.thumbnail_fps <= 0 else 1.0 / self.thumbnail_fps
+        )
+        self._counter_interval_sec = 0.0 if self.counter_fps <= 0 else 1.0 / self.counter_fps
+        self._last_analysis_ts = 0.0
+        self._last_ui_emit_ts = 0.0
+        self._last_thumbnail_emit_ts = 0.0
+        self._last_counter_emit_ts = 0.0
+        self._last_counter_value = (-1, -1)
+        self._overlay_timestamp_cache = ""
+        self._overlay_timestamp_second = -1
+        self._pose_overlay_hold_sec = self._read_float_env(
+            "SMART_MIRROR_POSE_OVERLAY_HOLD_SEC",
+            default=max(0.08, self._analysis_interval_sec * 2.5),
+            minimum=0.05,
+        )
+        self._face_box_hold_sec = self._read_float_env(
+            "SMART_MIRROR_FACE_BOX_HOLD_SEC",
+            default=max(0.08, self._analysis_interval_sec * 2.5),
+            minimum=0.05,
+        )
+        self._cached_pose_landmarks = None
+        self._cached_pose_colors = ((118, 242, 130), (118, 242, 130))
+        self._cached_pose_ts = 0.0
+        self._cached_face_boxes = []
+        self._cached_face_boxes_ts = 0.0
 
     def request_stop(self):
         self.stop_requested = True
@@ -211,6 +239,7 @@ class ExerciseWorker(QThread):
         self.face_recognition_active = True
         self.current_user_info = None
         self.display_user_name = self.assigned_user_name
+        self._clear_pose_overlay_cache()
         self._exit_save_retry_count = 0
         self._analysis_pose_grace_frames_remaining = 0
         self._last_reliable_pose_ts = 0.0
@@ -389,20 +418,16 @@ class ExerciseWorker(QThread):
                 self._audio_last_rep_marker = (sets_done, -1)
             return
 
-        range_marker = None
-        range_message = None
-        if up_range_miss:
-            range_marker = (sets_done, reps, "up")
-            if self.exercise_choice == "deadlift":
-                range_message = "Go deeper into the hinge before standing up."
-            else:
-                range_message = "Go higher. Reach the top range before lowering."
-        elif down_range_miss:
-            range_marker = (sets_done, reps, "down")
-            if self.exercise_choice == "deadlift":
-                range_message = "Stand tall at lockout before the next rep."
-            else:
-                range_message = "Lower fully. Reach the down range before next rep."
+        range_message, range_direction = range_miss_message(
+            exercise_choice=self.exercise_choice,
+            up_range_miss=up_range_miss,
+            down_range_miss=down_range_miss,
+        )
+        range_marker = (
+            (sets_done, reps, range_direction)
+            if range_message and range_direction
+            else None
+        )
 
         if range_marker is not None:
             if range_marker != self._audio_last_range_marker and self._emit_audio_message(
@@ -449,6 +474,28 @@ class ExerciseWorker(QThread):
             return self.current_user_info.get("username")
         return self.display_user_name
 
+    def _today_exercise_set_offset(self, user_info):
+        if not isinstance(user_info, dict):
+            return 0
+        user_id = user_info.get("user_id")
+        if not user_id:
+            return 0
+        try:
+            progress = self.db_handler.get_daily_exercise_progress(
+                user_id=user_id,
+                exercise=self.exercise_choice,
+                date_str=datetime.now().strftime("%Y-%m-%d"),
+            )
+            return max(0, int(progress.get("set_count") or 0))
+        except Exception as exc:
+            logging.error(
+                "Unable to resolve daily exercise progress for user_id=%s exercise=%s: %s",
+                user_id,
+                self.exercise_choice,
+                exc,
+            )
+            return 0
+
     def _motivation_line(
         self,
         reps,
@@ -462,69 +509,19 @@ class ExerciseWorker(QThread):
         down_range_miss=False,
         stagnant_seconds=0.0,
     ):
-        is_deadlift = self.exercise_choice == "deadlift"
-        if any("Warning" in text for text in feedback_texts):
-            return "Reset your posture first, then we go again with control."
-        if up_range_miss:
-            if is_deadlift:
-                return "You are close. Hinge deeper with control before driving up."
-            return "You are close. Lift a little higher and squeeze at the top."
-        if down_range_miss:
-            if is_deadlift:
-                return "Strong pull. Finish taller at lockout before the next rep."
-            return "Nice effort. Lower all the way down, then start the next curl."
-        if "Set complete!" in feedback_texts:
-            return "Great set. Take two deep breaths and get ready for the next round."
-        if "Ready to start!" in feedback_texts:
-            return "Setup looks strong. Start smooth and own the first rep."
-
-        if stable_start_detected and reps > 0:
-            if stagnant_seconds >= 14:
-                lines = [
-                    "You are not done yet. One clean rep breaks this plateau.",
-                    (
-                        "Stay with me. Brace your core, drive through your heels, and finish this rep."
-                        if is_deadlift
-                        else "Stay with me. Elbows tight, breathe out, and finish this rep."
-                    ),
-                    "Tough moment right now. Slow down, reset, and drive through.",
-                ]
-                return lines[int(stagnant_seconds // 4) % len(lines)]
-            if stagnant_seconds >= 8:
-                lines = [
-                    "You are stuck on this rep. Small reset, then go again.",
-                    "Keep calm and stay tight. You can get this next rep.",
-                    "One solid rep right now. Controlled up, controlled down.",
-                ]
-                return lines[int(stagnant_seconds // 3) % len(lines)]
-
-        if stable_start_detected and sets_done == 0 and reps == 0:
-            if is_deadlift:
-                return "Start position locked. Hinge back smoothly, then stand tall at lockout."
-            return "Start position locked. Curl up with intent and return with control."
-        if sets_done > 0 and reps == 0:
-            return "Strong previous set. Stay composed and attack this next one."
-        if reps_per_set > 0 and reps >= max(1, int(reps_per_set * 0.9)):
-            return "Last push. Finish every inch of these final reps."
-        if reps_per_set > 0 and reps >= max(1, int(reps_per_set * 0.75)):
-            return "You are in the hard zone now. Keep your form crisp."
-        if reps_per_set > 0 and reps >= max(1, reps_per_set // 2):
-            return "Halfway there. Keep breathing and keep moving clean."
-        if reps_per_set > 0 and reps >= max(1, int(reps_per_set * 0.25)):
-            return "Rhythm looks good. Stack clean reps one by one."
-        if reps > 0:
-            if rep_state == 1:
-                if is_deadlift:
-                    return "Push the floor away and drive hips forward to stand tall."
-                return "Drive up through the curl. Elbows stay pinned."
-            if rep_state == 2:
-                if is_deadlift:
-                    return "Control the hinge down. Keep the spine neutral and lats tight."
-                return "Control the way down. Earn the full range."
-            return "Good tempo. Stay smooth and keep tension."
-        if status_hint:
-            return status_hint
-        return "Stand centered and start when you are ready."
+        return motivation_line(
+            exercise_choice=self.exercise_choice,
+            reps=reps,
+            sets_done=sets_done,
+            reps_per_set=reps_per_set,
+            feedback_texts=feedback_texts,
+            status_hint=status_hint,
+            rep_state=rep_state,
+            stable_start_detected=stable_start_detected,
+            up_range_miss=up_range_miss,
+            down_range_miss=down_range_miss,
+            stagnant_seconds=stagnant_seconds,
+        )
 
     def _format_angle_line(self, angles):
         if not angles:
@@ -602,7 +599,7 @@ class ExerciseWorker(QThread):
             "current_weight": current_weight,
             "reps_per_set": reps_per_set,
             "angles_line": self._format_angle_line(angles),
-            "timestamp": datetime.now().strftime("%d %b %Y | %I:%M:%S %p"),
+            "timestamp": self._overlay_timestamp(),
             "motivation": self._motivation_line(
                 reps,
                 sets_done,
@@ -633,358 +630,167 @@ class ExerciseWorker(QThread):
         }
 
     def _draw_live_overlay(self, frame, overlay_data, feedback_texts=None):
-        feedback_texts = feedback_texts or []
-        h, w = frame.shape[:2]
-        scale = max(0.72, min(w / 1280.0, h / 720.0))
+        draw_live_overlay(frame, overlay_data, feedback_texts)
 
-        margin = int(20 * scale)
-        panel_w = int(470 * scale)
-        panel_h = int(250 * scale)
+    def _clear_pose_overlay_cache(self):
+        self._cached_pose_landmarks = None
+        self._cached_pose_ts = 0.0
 
-        panel_x = margin
-        panel_y = margin
+    def _cache_pose_overlay(self, pose_landmarks, connection_color, landmark_color, now):
+        if pose_landmarks is None:
+            return
+        self._cached_pose_landmarks = pose_landmarks
+        self._cached_pose_colors = (connection_color, landmark_color)
+        self._cached_pose_ts = now
 
-        draw_translucent_panel(
+    def _draw_cached_pose_overlay_if_recent(self, frame, now):
+        if self._cached_pose_landmarks is None:
+            return False
+        if (now - self._cached_pose_ts) > self._pose_overlay_hold_sec:
+            self._clear_pose_overlay_cache()
+            return False
+        connection_color, landmark_color = self._cached_pose_colors
+        mp_drawing.draw_landmarks(
             frame,
-            panel_x,
-            panel_y,
-            panel_w,
-            panel_h,
-            fill_color=(22, 30, 43),
-            border_color=(108, 201, 255),
-            alpha=0.66,
-            border_thickness=max(1, int(2 * scale)),
-        )
-
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        title_scale = 0.88 * scale
-        label_scale = 0.53 * scale
-        value_scale = 0.82 * scale
-
-        cv2.putText(
-            frame,
-            "LIVE PERFORMANCE",
-            (panel_x + int(18 * scale), panel_y + int(34 * scale)),
-            font,
-            title_scale,
-            (240, 248, 255),
-            max(1, int(2 * scale)),
-            cv2.LINE_AA,
-        )
-
-        cv2.putText(
-            frame,
-            f"User: {overlay_data['username']}",
-            (panel_x + int(18 * scale), panel_y + int(64 * scale)),
-            font,
-            0.64 * scale,
-            (186, 227, 255),
-            max(1, int(2 * scale)),
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            f"Exercise: {overlay_data['exercise']}",
-            (panel_x + int(18 * scale), panel_y + int(88 * scale)),
-            font,
-            label_scale,
-            (212, 223, 240),
-            max(1, int(1 * scale)),
-            cv2.LINE_AA,
-        )
-
-        chip_w = int((panel_w - int(52 * scale)) / 3)
-        chip_h = int(90 * scale)
-        chip_y = panel_y + int(102 * scale)
-        chip_gap = int(14 * scale)
-
-        stats = [
-            ("REPS", str(overlay_data["rep_count"])),
-            ("SETS", str(overlay_data["set_count"])),
-            (
-                "WEIGHT",
-                f"{overlay_data['current_weight']} lbs" if overlay_data["current_weight"] > 0 else "--",
+            self._cached_pose_landmarks,
+            mp_pose.POSE_CONNECTIONS,
+            mp_drawing.DrawingSpec(
+                color=connection_color,
+                thickness=2,
+                circle_radius=2,
             ),
-        ]
+            mp_drawing.DrawingSpec(
+                color=landmark_color,
+                thickness=2,
+                circle_radius=2,
+            ),
+        )
+        return True
 
-        for idx, (label, value) in enumerate(stats):
-            chip_x = panel_x + int(16 * scale) + idx * (chip_w + chip_gap)
-            draw_translucent_panel(
+    def _cache_face_boxes(self, face_locations, display_face_names, now):
+        cached = []
+        for ((top, right, bottom, left), name) in zip(face_locations, display_face_names):
+            cached.append(
+                (
+                    int(left * 4),
+                    int(top * 4),
+                    int(right * 4),
+                    int(bottom * 4),
+                    str(name),
+                )
+            )
+        if cached:
+            self._cached_face_boxes = cached
+            self._cached_face_boxes_ts = now
+
+    def _draw_cached_face_boxes_if_recent(self, frame, now):
+        if not self._cached_face_boxes:
+            return False
+        if (now - self._cached_face_boxes_ts) > self._face_box_hold_sec:
+            self._cached_face_boxes = []
+            self._cached_face_boxes_ts = 0.0
+            return False
+        for left, top, right, bottom, name in self._cached_face_boxes:
+            cv2.rectangle(
                 frame,
-                chip_x,
-                chip_y,
-                chip_w,
-                chip_h,
-                fill_color=(30, 41, 57),
-                border_color=(92, 166, 236),
-                alpha=0.7,
-                border_thickness=max(1, int(1 * scale)),
+                (left, top),
+                (right, bottom),
+                (110, 255, 180),
+                2,
+            )
+            cv2.rectangle(
+                frame,
+                (left, bottom - 28),
+                (right, bottom),
+                (18, 32, 54),
+                cv2.FILLED,
             )
             cv2.putText(
                 frame,
-                label,
-                (chip_x + int(12 * scale), chip_y + int(30 * scale)),
-                font,
-                0.48 * scale,
-                (176, 210, 246),
-                max(1, int(1 * scale)),
+                name,
+                (left + 8, bottom - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.56,
+                (224, 250, 248),
+                2,
                 cv2.LINE_AA,
             )
-            cv2.putText(
-                frame,
-                value,
-                (chip_x + int(12 * scale), chip_y + int(68 * scale)),
-                font,
-                value_scale,
-                (245, 250, 255),
-                max(1, int(2 * scale)),
-                cv2.LINE_AA,
-            )
+        return True
 
-        cv2.putText(
-            frame,
-            overlay_data["angles_line"],
-            (panel_x + int(18 * scale), panel_y + panel_h - int(20 * scale)),
-            font,
-            0.52 * scale,
-            (178, 197, 218),
-            max(1, int(1 * scale)),
-            cv2.LINE_AA,
+    def _overlay_timestamp(self):
+        now = datetime.now()
+        second = int(now.timestamp())
+        if second != self._overlay_timestamp_second:
+            self._overlay_timestamp_second = second
+            self._overlay_timestamp_cache = now.strftime("%d %b %Y | %I:%M:%S %p")
+        return self._overlay_timestamp_cache
+
+    def _should_run_analysis(self, now):
+        if self._analysis_interval_sec <= 0:
+            return True
+        return (now - self._last_analysis_ts) >= self._analysis_interval_sec
+
+    def _visual_output_due(self, now):
+        return (
+            self._ui_interval_sec <= 0
+            or self._thumbnail_interval_sec <= 0
+            or (now - self._last_ui_emit_ts) >= self._ui_interval_sec
+            or (now - self._last_thumbnail_emit_ts) >= self._thumbnail_interval_sec
         )
 
-        time_panel_w = int(390 * scale)
-        time_panel_h = int(62 * scale)
-        time_x = max(margin, w - time_panel_w - margin)
-        time_y = margin
-        draw_translucent_panel(
-            frame,
-            time_x,
-            time_y,
-            time_panel_w,
-            time_panel_h,
-            fill_color=(22, 30, 43),
-            border_color=(108, 201, 255),
-            alpha=0.64,
-            border_thickness=max(1, int(2 * scale)),
+    def _emit_visual_outputs(self, frame, now, force=False):
+        emit_frame = (
+            force
+            or self._ui_interval_sec <= 0
+            or (now - self._last_ui_emit_ts) >= self._ui_interval_sec
         )
-        cv2.putText(
-            frame,
-            overlay_data["timestamp"],
-            (time_x + int(16 * scale), time_y + int(39 * scale)),
-            font,
-            0.60 * scale,
-            (238, 246, 255),
-            max(1, int(2 * scale)),
-            cv2.LINE_AA,
+        emit_thumb = (
+            force
+            or self._thumbnail_interval_sec <= 0
+            or (now - self._last_thumbnail_emit_ts) >= self._thumbnail_interval_sec
         )
+        if emit_frame:
+            self.frame_signal.emit(frame)
+            self._last_ui_emit_ts = now
+        if emit_thumb:
+            thumb = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+            self.thumbnail_frame_signal.emit(thumb)
+            self._last_thumbnail_emit_ts = now
+        return emit_frame or emit_thumb
 
-        if overlay_data.get("show_range_bars"):
-            rep_angle = float(overlay_data.get("rep_angle") or 0.0)
-            up_range = overlay_data.get("up_range") or (0.0, 0.0)
-            down_range = overlay_data.get("down_range") or (0.0, 0.0)
-            up_min, up_max = float(up_range[0]), float(up_range[1])
-            down_min, down_max = float(down_range[0]), float(down_range[1])
-            rep_state = int(overlay_data.get("rep_state", 0))
-            blink_on = ((datetime.now().microsecond // 180000) % 2) == 0
+    def _emit_counters_if_due(self, reps, sets_done, now, force=False):
+        counters = (int(reps), int(sets_done))
+        if not force:
+            if counters == self._last_counter_value and (
+                now - self._last_counter_emit_ts
+            ) < self._counter_interval_sec:
+                return
+            if (
+                now - self._last_counter_emit_ts
+            ) < self._counter_interval_sec and counters != self._last_counter_value:
+                return
+        self.counters_signal.emit(*counters)
+        self._last_counter_value = counters
+        self._last_counter_emit_ts = now
 
-            range_panel_w = int(390 * scale)
-            range_panel_h = int(154 * scale)
-            range_x = max(margin, w - range_panel_w - margin)
-            range_y = time_y + time_panel_h + int(12 * scale)
-            draw_translucent_panel(
-                frame,
-                range_x,
-                range_y,
-                range_panel_w,
-                range_panel_h,
-                fill_color=(22, 30, 43),
-                border_color=(108, 201, 255),
-                alpha=0.64,
-                border_thickness=max(1, int(2 * scale)),
-            )
-            cv2.putText(
-                frame,
-                "RANGE CHECK",
-                (range_x + int(16 * scale), range_y + int(28 * scale)),
-                font,
-                0.58 * scale,
-                (232, 244, 255),
-                max(1, int(2 * scale)),
-                cv2.LINE_AA,
-            )
-
-            bar_left = range_x + int(16 * scale)
-            bar_w = range_panel_w - int(32 * scale)
-            bar_h = int(18 * scale)
-            up_bar_y = range_y + int(48 * scale)
-            down_bar_y = range_y + int(100 * scale)
-
-            angle_span = max(1.0, down_max - up_min)
-            up_progress = max(0.0, min(1.0, (down_max - rep_angle) / angle_span))
-            down_progress = max(0.0, min(1.0, (rep_angle - up_min) / angle_span))
-            up_hit = up_min <= rep_angle <= up_max
-            down_hit = down_min <= rep_angle <= down_max
-            up_miss = bool(overlay_data.get("up_range_miss", False))
-            down_miss = bool(overlay_data.get("down_range_miss", False))
-            up_range_label = str(overlay_data.get("up_range_label", "UP"))
-            down_range_label = str(overlay_data.get("down_range_label", "DOWN"))
-
-            def draw_range_bar(label, y, progress, target_min, target_max, in_target, expected_now, miss_now):
-                draw_translucent_panel(
-                    frame,
-                    bar_left,
-                    y,
-                    bar_w,
-                    bar_h,
-                    fill_color=(26, 38, 54),
-                    border_color=(76, 132, 188),
-                    alpha=0.74,
-                    border_thickness=max(1, int(1 * scale)),
-                )
-
-                fill_w = max(1, int(bar_w * progress))
-                if in_target:
-                    fill_color = (64, 188, 120)
-                    border_color = (118, 242, 130)
-                    state_text = "ON TARGET"
-                elif miss_now and blink_on:
-                    fill_color = (52, 46, 188)
-                    border_color = (92, 92, 255)
-                    state_text = "MISSED RANGE"
-                elif expected_now:
-                    fill_color = (82, 132, 214)
-                    border_color = (116, 168, 248)
-                    state_text = "IN PROGRESS"
-                else:
-                    fill_color = (66, 108, 164)
-                    border_color = (100, 144, 206)
-                    state_text = "READY"
-
-                cv2.rectangle(
-                    frame,
-                    (bar_left, y),
-                    (bar_left + fill_w, y + bar_h),
-                    fill_color,
-                    -1,
-                )
-                cv2.rectangle(
-                    frame,
-                    (bar_left, y),
-                    (bar_left + bar_w, y + bar_h),
-                    border_color,
-                    max(1, int(2 * scale)),
-                )
-
-                cv2.putText(
-                    frame,
-                    f"{label} {int(target_min)}-{int(target_max)}deg",
-                    (bar_left, y - int(7 * scale)),
-                    font,
-                    0.46 * scale,
-                    (196, 220, 246),
-                    max(1, int(1 * scale)),
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    frame,
-                    state_text,
-                    (bar_left + int(6 * scale), y + bar_h + int(16 * scale)),
-                    font,
-                    0.44 * scale,
-                    (214, 232, 250),
-                    max(1, int(1 * scale)),
-                    cv2.LINE_AA,
-                )
-
-            draw_range_bar(
-                up_range_label,
-                up_bar_y,
-                up_progress,
-                up_min,
-                up_max,
-                up_hit,
-                rep_state == 1,
-                up_miss,
-            )
-            draw_range_bar(
-                down_range_label,
-                down_bar_y,
-                down_progress,
-                down_min,
-                down_max,
-                down_hit,
-                rep_state == 2,
-                down_miss,
-            )
-
-        motivation_h = int(72 * scale)
-        motivation_x = margin
-        motivation_y = h - motivation_h - margin
-        motivation_w = max(100, w - (2 * margin))
-
-        draw_translucent_panel(
-            frame,
-            motivation_x,
-            motivation_y,
-            motivation_w,
-            motivation_h,
-            fill_color=(17, 77, 88),
-            border_color=(88, 223, 230),
-            alpha=0.68,
-            border_thickness=max(1, int(2 * scale)),
-        )
-        cv2.putText(
-            frame,
-            overlay_data["motivation"],
-            (motivation_x + int(18 * scale), motivation_y + int(45 * scale)),
-            font,
-            0.68 * scale,
-            (235, 255, 255),
-            max(1, int(2 * scale)),
-            cv2.LINE_AA,
-        )
-
-        warning_texts = [text for text in feedback_texts if "Warning" in text]
-        if warning_texts:
-            warning_text = warning_texts[0]
-            warning_w = min(int(640 * scale), w - 2 * margin)
-            warning_h = int(58 * scale)
-            warning_x = max(margin, (w - warning_w) // 2)
-            warning_y = margin + int(80 * scale)
-            draw_translucent_panel(
-                frame,
-                warning_x,
-                warning_y,
-                warning_w,
-                warning_h,
-                fill_color=(61, 25, 32),
-                border_color=(255, 124, 124),
-                alpha=0.74,
-                border_thickness=max(1, int(2 * scale)),
-            )
-            cv2.putText(
-                frame,
-                warning_text,
-                (warning_x + int(16 * scale), warning_y + int(36 * scale)),
-                font,
-                0.62 * scale,
-                (255, 230, 230),
-                max(1, int(2 * scale)),
-                cv2.LINE_AA,
-            )
+    def _sleep_to_target_loop(self, loop_started_at):
+        if self._loop_interval_sec <= 0:
+            return
+        elapsed = time.monotonic() - loop_started_at
+        remaining = self._loop_interval_sec - elapsed
+        if remaining <= 0:
+            return
+        self.msleep(max(1, int(remaining * 1000)))
 
     def run(self):
         cap = None
         mp_pose_solution = None
         try:
-            cap = cv2.VideoCapture(self.camera_index)
-            if not cap.isOpened():
+            cap = open_camera_capture(self.camera_index)
+            if cap is None or not cap.isOpened():
                 self.status_signal.emit(f"Error: Could not open camera {self.camera_index}.")
                 logging.error(f"Could not open camera {self.camera_index}.")
                 return
-
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
             logging.info(f"Camera {self.camera_index} initialized.")
 
             mp_pose_solution = mp_pose.Pose(
@@ -1024,439 +830,468 @@ class ExerciseWorker(QThread):
                 return
 
             occlusion_timeout = self.exit_no_pose_frames
+            analysis_overlay_data = None
+            analysis_feedback_texts = []
+            registration_overlay_data = None
+            recognition_overlay_data = None
+            self._clear_pose_overlay_cache()
+            self._cached_face_boxes = []
+            self._cached_face_boxes_ts = 0.0
 
             while not self.stop_requested:
+                loop_started_at = time.monotonic()
                 ret, frame = cap.read()
                 if not ret:
                     self.status_signal.emit("Failed to capture frame.")
                     logging.error("Failed to capture frame from camera.")
                     break
 
-                display_frame = frame.copy()
+                now = time.monotonic()
+                analysis_due = self._should_run_analysis(now)
+                if analysis_due:
+                    self._last_analysis_ts = now
 
                 # If exercise analysis is active, skip face recognition
                 if self.exercise_analysis_active and not self.capturing_new_user_data:
                     try:
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        results = mp_pose_solution.process(frame_rgb)
-                        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        frame_bgr = frame
+                        if analysis_due:
+                            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                            results = mp_pose_solution.process(frame_rgb)
 
-                        reliable_pose = bool(
-                            results.pose_landmarks
-                            and self._has_reliable_pose(results.pose_landmarks.landmark)
-                        )
-                        if reliable_pose:
-                            self.exercise_analyzer.no_pose_frames = 0
-                            self._analysis_pose_grace_frames_remaining = 0
-                            self._last_reliable_pose_ts = time.monotonic()
-                            landmarks = results.pose_landmarks.landmark
-                            feedback_texts, overlay_metrics = self.exercise_analyzer.analyze_exercise_form(
-                                landmarks,
-                                frame_bgr,
+                            reliable_pose = bool(
+                                results.pose_landmarks
+                                and self._has_reliable_pose(results.pose_landmarks.landmark)
                             )
-
-                            if not self.exercise_analyzer.stable_start_detected:
-                                connection_color = (255, 140, 90)
-                                landmark_color = (255, 140, 90)
-                            elif self.exercise_analyzer.bend_warning_displayed:
-                                connection_color = (70, 70, 255)
-                                landmark_color = (70, 70, 255)
-                            else:
-                                connection_color = (118, 242, 130)
-                                landmark_color = (118, 242, 130)
-
-                            mp_drawing.draw_landmarks(
-                                frame_bgr,
-                                results.pose_landmarks,
-                                mp_pose.POSE_CONNECTIONS,
-                                mp_drawing.DrawingSpec(
-                                    color=connection_color,
-                                    thickness=2,
-                                    circle_radius=2,
-                                ),
-                                mp_drawing.DrawingSpec(
-                                    color=landmark_color,
-                                    thickness=2,
-                                    circle_radius=2,
-                                ),
-                            )
-
-                            self._emit_important_audio(feedback_texts, overlay_metrics)
-
-                            overlay_data = self._build_overlay_data(overlay_metrics, feedback_texts)
-                            self._draw_live_overlay(frame_bgr, overlay_data, feedback_texts)
-
-                            final_frame = frame_bgr
-                            self.frame_signal.emit(final_frame)
-                            self.thumbnail_frame_signal.emit(
-                                cv2.resize(final_frame, (160, 90), interpolation=cv2.INTER_AREA)
-                            )
-                            self.counters_signal.emit(
-                                self.exercise_analyzer.rep_count,
-                                self.exercise_analyzer.set_count,
-                            )
-                        else:
-                            self.exercise_analyzer.update_current_weight(frame_bgr)
-                            grace_active = self._analysis_pose_grace_frames_remaining > 0
-                            start_position_locked = bool(
-                                self.exercise_analyzer
-                                and self.exercise_analyzer.stable_start_detected
-                            )
-                            if grace_active:
-                                self._analysis_pose_grace_frames_remaining -= 1
-                                status_hint = "Face recognized. Align upper body to start tracking."
-                            elif not start_position_locked:
-                                # Do not run person-exit logic before start position is locked (green landmarks).
+                            if reliable_pose:
                                 self.exercise_analyzer.no_pose_frames = 0
-                                status_hint = "Move to start position (green lines) to begin tracking."
-                            else:
-                                now = time.monotonic()
-                                if self._last_reliable_pose_ts <= 0.0:
-                                    self._last_reliable_pose_ts = now
-                                seconds_since_reliable = now - self._last_reliable_pose_ts
+                                self._analysis_pose_grace_frames_remaining = 0
+                                self._last_reliable_pose_ts = now
+                                landmarks = results.pose_landmarks.landmark
+                                feedback_texts, overlay_metrics = self.exercise_analyzer.analyze_exercise_form(
+                                    landmarks,
+                                    frame_bgr,
+                                )
 
-                                if seconds_since_reliable < self.exit_reacquire_grace_seconds:
-                                    self.exercise_analyzer.no_pose_frames = 0
-                                    status_hint = "Tracking lost briefly. Step back in to continue."
+                                if not self.exercise_analyzer.stable_start_detected:
+                                    connection_color = (255, 140, 90)
+                                    landmark_color = (255, 140, 90)
+                                elif self.exercise_analyzer.bend_warning_displayed:
+                                    connection_color = (70, 70, 255)
+                                    landmark_color = (70, 70, 255)
                                 else:
-                                    self.exercise_analyzer.no_pose_frames += 1
-                                    if results.pose_landmarks:
-                                        logging.debug(
-                                            "Ignoring unstable pose landmarks during active session (no_pose_frames=%s).",
-                                            self.exercise_analyzer.no_pose_frames,
-                                        )
-                                        status_hint = "Body landmarks unstable. Hold still in frame."
+                                    connection_color = (118, 242, 130)
+                                    landmark_color = (118, 242, 130)
+
+                                self._cache_pose_overlay(
+                                    results.pose_landmarks,
+                                    connection_color,
+                                    landmark_color,
+                                    now,
+                                )
+
+                                if self._visual_output_due(now):
+                                    self._draw_cached_pose_overlay_if_recent(frame_bgr, now)
+
+                                self._emit_important_audio(feedback_texts, overlay_metrics)
+                                analysis_overlay_data = self._build_overlay_data(
+                                    overlay_metrics,
+                                    feedback_texts,
+                                )
+                                analysis_feedback_texts = list(feedback_texts)
+
+                                if self._visual_output_due(now):
+                                    self._draw_live_overlay(
+                                        frame_bgr,
+                                        analysis_overlay_data,
+                                        feedback_texts,
+                                    )
+                                    self._emit_visual_outputs(frame_bgr, now)
+
+                                self._emit_counters_if_due(
+                                    self.exercise_analyzer.rep_count,
+                                    self.exercise_analyzer.set_count,
+                                    now,
+                                )
+                            else:
+                                self.exercise_analyzer.update_current_weight(frame_bgr)
+                                grace_active = self._analysis_pose_grace_frames_remaining > 0
+                                start_position_locked = bool(
+                                    self.exercise_analyzer
+                                    and self.exercise_analyzer.stable_start_detected
+                                )
+                                if grace_active:
+                                    self._analysis_pose_grace_frames_remaining -= 1
+                                    status_hint = "Face recognized. Align upper body to start tracking."
+                                elif not start_position_locked:
+                                    # Do not run person-exit logic before start position is locked (green landmarks).
+                                    self.exercise_analyzer.no_pose_frames = 0
+                                    status_hint = "Move to start position (green lines) to begin tracking."
+                                else:
+                                    if self._last_reliable_pose_ts <= 0.0:
+                                        self._last_reliable_pose_ts = now
+                                    seconds_since_reliable = now - self._last_reliable_pose_ts
+
+                                    if seconds_since_reliable < self.exit_reacquire_grace_seconds:
+                                        self.exercise_analyzer.no_pose_frames = 0
+                                        status_hint = "Tracking lost briefly. Step back in to continue."
                                     else:
-                                        logging.debug(
-                                            "No pose detected. no_pose_frames: %s",
-                                            self.exercise_analyzer.no_pose_frames,
+                                        self.exercise_analyzer.no_pose_frames += 1
+                                        if results.pose_landmarks:
+                                            logging.debug(
+                                                "Ignoring unstable pose landmarks during active session (no_pose_frames=%s).",
+                                                self.exercise_analyzer.no_pose_frames,
+                                            )
+                                            status_hint = "Body landmarks unstable. Hold still in frame."
+                                        else:
+                                            logging.debug(
+                                                "No pose detected. no_pose_frames: %s",
+                                                self.exercise_analyzer.no_pose_frames,
+                                            )
+                                            status_hint = "Body not detected. Step back into frame."
+
+                                analysis_overlay_data = self._build_overlay_data(
+                                    metrics={
+                                        "rep_count": self.exercise_analyzer.rep_count,
+                                        "set_count": self.exercise_analyzer.set_count,
+                                        "current_weight": self.exercise_analyzer.current_weight,
+                                    },
+                                    feedback_texts=[],
+                                    status_hint=status_hint,
+                                )
+                                analysis_feedback_texts = []
+                                if self._visual_output_due(now):
+                                    self._draw_cached_pose_overlay_if_recent(frame_bgr, now)
+                                    self._draw_live_overlay(frame_bgr, analysis_overlay_data, [])
+                                    self._emit_visual_outputs(frame_bgr, now)
+                                self._emit_counters_if_due(
+                                    self.exercise_analyzer.rep_count,
+                                    self.exercise_analyzer.set_count,
+                                    now,
+                                )
+
+                                if (
+                                    not grace_active
+                                    and start_position_locked
+                                    and self.exercise_analyzer.no_pose_frames >= occlusion_timeout
+                                ):
+                                    self.status_signal.emit("Person exited the frame, updating database...")
+                                    logging.info("Person exited frame. Updating database.")
+                                    had_activity = bool(
+                                        self.exercise_analyzer.rep_data
+                                        or self.exercise_analyzer.rep_count > 0
+                                        or self.exercise_analyzer.sets_reps
+                                    )
+                                    record = self.exercise_analyzer.update_data()
+                                    if record:
+                                        self._exit_save_retry_count = 0
+                                        self.status_signal.emit("Exercise data saved locally.")
+                                        logging.info("Data saved locally.")
+                                        self.data_updated.emit()
+                                        next_mode_reason = "Person exited frame. Ready for next user."
+                                    elif had_activity:
+                                        self._exit_save_retry_count = 0
+                                        logging.error(
+                                            "Exercise session had activity but save returned no record. "
+                                            "Resetting session state for next user."
                                         )
-                                        status_hint = "Body not detected. Step back into frame."
-                            overlay_data = self._build_overlay_data(
+                                        self.status_signal.emit(
+                                            "Failed to save exercise data. Resetting for next user."
+                                        )
+                                        self.exercise_analyzer.reset_counters()
+                                        next_mode_reason = "Person exited frame. Reset complete. Waiting for recognition."
+                                    else:
+                                        self._exit_save_retry_count = 0
+                                        self.status_signal.emit("No exercise data to save.")
+                                        next_mode_reason = "Person exited frame. Waiting for recognition."
+
+                                    self._switch_to_face_recognition_mode(reason=next_mode_reason)
+                                    analysis_overlay_data = None
+                                    analysis_feedback_texts = []
+                                    recognition_overlay_data = None
+                                    self._emit_counters_if_due(0, 0, now, force=True)
+                        elif self._visual_output_due(now):
+                            overlay_data = analysis_overlay_data or self._build_overlay_data(
                                 metrics={
                                     "rep_count": self.exercise_analyzer.rep_count,
                                     "set_count": self.exercise_analyzer.set_count,
                                     "current_weight": self.exercise_analyzer.current_weight,
                                 },
                                 feedback_texts=[],
-                                status_hint=status_hint,
+                                status_hint="Tracking movement...",
                             )
-                            self._draw_live_overlay(frame_bgr, overlay_data, [])
-                            self.frame_signal.emit(frame_bgr)
-                            self.thumbnail_frame_signal.emit(
-                                cv2.resize(frame_bgr, (160, 90), interpolation=cv2.INTER_AREA)
-                            )
-                            self.counters_signal.emit(
+                            self._draw_cached_pose_overlay_if_recent(frame_bgr, now)
+                            self._draw_live_overlay(frame_bgr, overlay_data, analysis_feedback_texts)
+                            self._emit_visual_outputs(frame_bgr, now)
+
+                        if self.exercise_analyzer:
+                            self._emit_counters_if_due(
                                 self.exercise_analyzer.rep_count,
                                 self.exercise_analyzer.set_count,
+                                now,
                             )
-
-                            if (
-                                not grace_active
-                                and start_position_locked
-                                and self.exercise_analyzer.no_pose_frames >= occlusion_timeout
-                            ):
-                                self.status_signal.emit("Person exited the frame, updating database...")
-                                logging.info("Person exited frame. Updating database.")
-                                had_activity = bool(
-                                    self.exercise_analyzer.rep_data
-                                    or self.exercise_analyzer.rep_count > 0
-                                    or self.exercise_analyzer.set_count > 0
-                                    or self.exercise_analyzer.sets_reps
-                                )
-                                record = self.exercise_analyzer.update_data()
-                                if record:
-                                    self._exit_save_retry_count = 0
-                                    self.status_signal.emit("Exercise data saved locally.")
-                                    logging.info("Data saved locally.")
-                                    self.data_updated.emit()
-                                    next_mode_reason = "Person exited frame. Ready for next user."
-                                elif had_activity:
-                                    self._exit_save_retry_count = 0
-                                    logging.error(
-                                        "Exercise session had activity but save returned no record. "
-                                        "Resetting session state for next user."
-                                    )
-                                    self.status_signal.emit(
-                                        "Failed to save exercise data. Resetting for next user."
-                                    )
-                                    self.exercise_analyzer.reset_counters()
-                                    next_mode_reason = "Person exited frame. Reset complete. Waiting for recognition."
-                                else:
-                                    self._exit_save_retry_count = 0
-                                    self.status_signal.emit("No exercise data to save.")
-                                    next_mode_reason = "Person exited frame. Waiting for recognition."
-
-                                self._switch_to_face_recognition_mode(reason=next_mode_reason)
-                                self.counters_signal.emit(0, 0)
-
-                        self.msleep(10)
+                        self._sleep_to_target_loop(loop_started_at)
                         continue
 
                     except Exception as e:
                         self.status_signal.emit("Exercise analysis error.")
                         logging.error(f"Exercise analysis error: {e}")
-                        self.msleep(10)
+                        self._sleep_to_target_loop(loop_started_at)
                         continue
 
                 # If capturing new user face data
                 if self.capturing_new_user_data:
                     try:
-                        small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-                        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                        display_frame = frame.copy()
+                        if analysis_due:
+                            small_frame = cv2.resize(display_frame, (0, 0), fx=0.25, fy=0.25)
+                            rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-                        face_locations = fr_lib.face_locations(
-                            rgb_small_frame,
-                            number_of_times_to_upsample=0,
-                            model="hog",
-                        )
-                        encodings = fr_lib.face_encodings(rgb_small_frame, face_locations)
-                        capture_feedback = "Hold still and look straight at the camera."
-                        if len(face_locations) == 1 and len(encodings) == 1:
-                            top, right, bottom, left = face_locations[0]
-                            face_area = max(0, bottom - top) * max(0, right - left)
-                            if face_area >= self.MIN_REGISTRATION_FACE_AREA:
-                                self.new_user_encodings.append(encodings[0])
-                            else:
-                                capture_feedback = "Move closer so your face appears larger."
-                        elif len(face_locations) > 1:
-                            capture_feedback = "Multiple faces detected. Keep only one face in frame."
-                        else:
-                            capture_feedback = "No face detected. Center your face in frame."
-
-                        progress = len(self.new_user_encodings)
-                        hint = (
-                            f"Registering {self.new_user_name}: "
-                            f"{progress}/{self.frames_to_capture} | {capture_feedback}"
-                        )
-                        overlay_data = self._build_overlay_data(
-                            metrics={"rep_count": 0, "set_count": 0, "current_weight": 0},
-                            feedback_texts=[],
-                            status_hint=hint,
-                        )
-                        self._draw_live_overlay(display_frame, overlay_data, [])
-
-                        self.frame_signal.emit(display_frame)
-                        self.thumbnail_frame_signal.emit(
-                            cv2.resize(display_frame, (160, 90), interpolation=cv2.INTER_AREA)
-                        )
-
-                        if len(self.new_user_encodings) >= self.frames_to_capture:
-                            self.status_signal.emit(f"Registering user {self.new_user_name}...")
-                            logging.info(f"Registering new user: {self.new_user_name}")
-                            registered_name = self.new_user_name
-                            registration_success = self.face_recognizer.register_new_user(
-                                registered_name,
-                                self.new_user_encodings,
+                            face_locations = fr_lib.face_locations(
+                                rgb_small_frame,
+                                number_of_times_to_upsample=0,
+                                model="hog",
                             )
-                            if registration_success:
-                                self.status_signal.emit(
-                                    f"User {registered_name} registered successfully."
-                                )
-                                logging.info(
-                                    f"User {registered_name} registered successfully."
-                                )
-                                self.display_user_name = registered_name
+                            encodings = fr_lib.face_encodings(rgb_small_frame, face_locations)
+                            capture_feedback = "Hold still and look straight at the camera."
+                            if len(face_locations) == 1 and len(encodings) == 1:
+                                top, right, bottom, left = face_locations[0]
+                                face_area = max(0, bottom - top) * max(0, right - left)
+                                if face_area >= self.MIN_REGISTRATION_FACE_AREA:
+                                    self.new_user_encodings.append(encodings[0])
+                                else:
+                                    capture_feedback = "Move closer so your face appears larger."
+                            elif len(face_locations) > 1:
+                                capture_feedback = "Multiple faces detected. Keep only one face in frame."
                             else:
-                                self.status_signal.emit(
-                                    f"Failed to register user {registered_name}."
-                                )
-                                logging.error(
-                                    f"Failed to register user {registered_name}."
-                                )
-                            self.new_user_registration_signal.emit(
-                                registered_name,
-                                registration_success,
+                                capture_feedback = "No face detected. Center your face in frame."
+
+                            progress = len(self.new_user_encodings)
+                            hint = (
+                                f"Registering {self.new_user_name}: "
+                                f"{progress}/{self.frames_to_capture} | {capture_feedback}"
+                            )
+                            registration_overlay_data = self._build_overlay_data(
+                                metrics={"rep_count": 0, "set_count": 0, "current_weight": 0},
+                                feedback_texts=[],
+                                status_hint=hint,
                             )
 
-                            self.new_user_name = None
-                            self.new_user_encodings = []
-                            self.capturing_new_user_data = False
-                            self.face_recognition_active = True
-                            self._reset_face_recognition_state()
+                            if len(self.new_user_encodings) >= self.frames_to_capture:
+                                self.status_signal.emit(f"Registering user {self.new_user_name}...")
+                                logging.info(f"Registering new user: {self.new_user_name}")
+                                registered_name = self.new_user_name
+                                registration_success = self.face_recognizer.register_new_user(
+                                    registered_name,
+                                    self.new_user_encodings,
+                                )
+                                if registration_success:
+                                    self.status_signal.emit(
+                                        f"User {registered_name} registered successfully."
+                                    )
+                                    logging.info(
+                                        f"User {registered_name} registered successfully."
+                                    )
+                                    self.display_user_name = registered_name
+                                else:
+                                    self.status_signal.emit(
+                                        f"Failed to register user {registered_name}."
+                                    )
+                                    logging.error(
+                                        f"Failed to register user {registered_name}."
+                                    )
+                                self.new_user_registration_signal.emit(
+                                    registered_name,
+                                    registration_success,
+                                )
 
-                        self.msleep(10)
+                                self.new_user_name = None
+                                self.new_user_encodings = []
+                                self.capturing_new_user_data = False
+                                self.face_recognition_active = True
+                                registration_overlay_data = None
+                                self._reset_face_recognition_state()
+
+                        if self._visual_output_due(now):
+                            overlay_data = registration_overlay_data or self._build_overlay_data(
+                                metrics={"rep_count": 0, "set_count": 0, "current_weight": 0},
+                                feedback_texts=[],
+                                status_hint="Capturing face data...",
+                            )
+                            self._draw_live_overlay(display_frame, overlay_data, [])
+                            self._emit_visual_outputs(display_frame, now)
+
+                        self._sleep_to_target_loop(loop_started_at)
                         continue
                     except Exception as e:
                         self.status_signal.emit("New user registration error.")
                         logging.error(f"New user registration error: {e}")
-                        self.msleep(10)
+                        self._sleep_to_target_loop(loop_started_at)
                         continue
 
                 # Face Recognition Mode
                 if self.face_recognition_active:
                     try:
-                        _, face_locations, face_names = self.face_recognizer.recognize_faces(frame)
-                        status_hint = "Stand in front of the camera for recognition."
-                        primary_face_index = self._select_primary_face_index(face_locations)
-                        primary_raw_label = (
-                            face_names[primary_face_index]
-                            if primary_face_index is not None and primary_face_index < len(face_names)
-                            else None
-                        )
-                        stable_primary_label = self._update_stable_primary_label(primary_raw_label)
-                        display_face_names = list(face_names)
-                        if (
-                            primary_face_index is not None
-                            and stable_primary_label is not None
-                            and primary_face_index < len(display_face_names)
-                        ):
-                            display_face_names[primary_face_index] = stable_primary_label
+                        display_frame = frame.copy()
+                        if analysis_due:
+                            _, face_locations, face_names = self.face_recognizer.recognize_faces(frame)
+                            status_hint = "Stand in front of the camera for recognition."
+                            primary_face_index = self._select_primary_face_index(face_locations)
+                            primary_raw_label = (
+                                face_names[primary_face_index]
+                                if primary_face_index is not None and primary_face_index < len(face_names)
+                                else None
+                            )
+                            stable_primary_label = self._update_stable_primary_label(primary_raw_label)
+                            display_face_names = list(face_names)
+                            if (
+                                primary_face_index is not None
+                                and stable_primary_label is not None
+                                and primary_face_index < len(display_face_names)
+                            ):
+                                display_face_names[primary_face_index] = stable_primary_label
 
-                        for ((top, right, bottom, left), name) in zip(face_locations, display_face_names):
-                            top *= 4
-                            right *= 4
-                            bottom *= 4
-                            left *= 4
-                            cv2.rectangle(
-                                display_frame,
-                                (left, top),
-                                (right, bottom),
-                                (110, 255, 180),
-                                2,
-                            )
-                            cv2.rectangle(
-                                display_frame,
-                                (left, bottom - 28),
-                                (right, bottom),
-                                (18, 32, 54),
-                                cv2.FILLED,
-                            )
-                            cv2.putText(
-                                display_frame,
-                                name,
-                                (left + 8, bottom - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.56,
-                                (224, 250, 248),
-                                2,
-                                cv2.LINE_AA,
-                            )
+                            self._cache_face_boxes(face_locations, display_face_names, now)
+                            self._draw_cached_face_boxes_if_recent(display_frame, now)
 
-                        if primary_face_index is not None and primary_face_index < len(display_face_names):
-                            effective_label = display_face_names[primary_face_index]
-                            if effective_label == "Unknown":
-                                self.unknown_frames = min(
-                                    self.UNKNOWN_FRAME_THRESHOLD,
-                                    self.unknown_frames + 1,
-                                )
+                            if primary_face_index is not None and primary_face_index < len(display_face_names):
+                                effective_label = display_face_names[primary_face_index]
+                                if effective_label == "Unknown":
+                                    self.unknown_frames = min(
+                                        self.UNKNOWN_FRAME_THRESHOLD,
+                                        self.unknown_frames + 1,
+                                    )
+                                    self.known_frames = max(0, self.known_frames - self.KNOWN_FRAME_DECAY)
+                                    if self.known_frames == 0:
+                                        self.last_recognized_user = None
+                                    status_hint = "Unknown user detected. Hold still for registration."
+                                    if (
+                                        self.unknown_frames >= self.UNKNOWN_FRAME_THRESHOLD
+                                        and not self.unknown_stable_detected
+                                    ):
+                                        self.status_signal.emit(
+                                            "Stable unknown user detected. Prompting for user name..."
+                                        )
+                                        logging.info("Stable unknown user detected.")
+                                        self.unknown_user_detected.emit()
+                                        self.unknown_stable_detected = True
+                                else:
+                                    recognized_user = effective_label
+                                    self.unknown_frames = max(
+                                        0,
+                                        self.unknown_frames - self.UNKNOWN_FRAME_DECAY,
+                                    )
+                                    if self.unknown_frames == 0:
+                                        self.unknown_stable_detected = False
+                                    self.display_user_name = recognized_user
+                                    status_hint = "User recognized. Preparing real-time feedback."
+                                    if self.last_recognized_user is None:
+                                        self.last_recognized_user = recognized_user
+                                        self.known_frames = max(1, self.known_frames)
+                                    elif recognized_user == self.last_recognized_user:
+                                        self.known_frames = min(
+                                            self.KNOWN_FRAME_THRESHOLD,
+                                            self.known_frames + 1,
+                                        )
+                                    else:
+                                        self.last_recognized_user = recognized_user
+                                        self.known_frames = max(
+                                            1,
+                                            self.known_frames - self.KNOWN_FRAME_SWITCH_PENALTY,
+                                        )
+
+                                    if self.known_frames >= self.KNOWN_FRAME_THRESHOLD:
+                                        logging.info(f"User recognized: {recognized_user}")
+                                        user_info = self.db_handler.get_member_info(recognized_user)
+                                        if not user_info:
+                                            # Edge nodes can have face embeddings before member rows are synced.
+                                            # Auto-create a lightweight local member so analysis can continue.
+                                            provisional_member = {
+                                                "user_id": str(uuid.uuid4()),
+                                                "username": recognized_user,
+                                                "email": "NA",
+                                                "membership": "NA",
+                                                "joined_on": datetime.utcnow().strftime("%Y-%m-%d"),
+                                            }
+                                            try:
+                                                inserted = self.db_handler.insert_member_local(provisional_member)
+                                                user_info = self.db_handler.get_member_info(recognized_user)
+                                                logging.info(
+                                                    "Auto-provisioned local member for %s (inserted=%s).",
+                                                    recognized_user,
+                                                    inserted,
+                                                )
+                                            except Exception as exc:
+                                                logging.error(
+                                                    "Failed to auto-provision member %s: %s",
+                                                    recognized_user,
+                                                    exc,
+                                                )
+                                                user_info = None
+
+                                            if not user_info:
+                                                user_info = provisional_member
+
+                                        self.user_recognized_signal.emit(user_info)
+                                        self.status_signal.emit(
+                                            f"Face recognized as {recognized_user}, starting exercise analysis."
+                                        )
+                                        logging.info(
+                                            f"Starting exercise analysis for user: {recognized_user}"
+                                        )
+                                        self.current_user_info = user_info
+                                        self.display_user_name = recognized_user
+                                        resume_set_offset = self._today_exercise_set_offset(user_info)
+                                        self.exercise_analyzer = ExerciseAnalyzer(
+                                            self.exercise_choice,
+                                            aruco_detector,
+                                            self.db_handler,
+                                            user_id=user_info.get("user_id"),
+                                            username_snapshot=recognized_user,
+                                            starting_set_count=resume_set_offset,
+                                        )
+                                        self._clear_pose_overlay_cache()
+                                        if resume_set_offset > 0:
+                                            self.status_signal.emit(
+                                                "Welcome back. Continuing "
+                                                f"{self.exercise_choice.replace('_', ' ')} from set {resume_set_offset + 1}."
+                                            )
+                                        self._exit_save_retry_count = 0
+                                        self._analysis_pose_grace_frames_remaining = self.pose_acquire_grace_frames
+                                        self._last_reliable_pose_ts = now
+                                        self.exercise_analysis_active = True
+                                        self.face_recognition_active = False
+                                        analysis_overlay_data = None
+                                        analysis_feedback_texts = []
+                                        self._reset_face_recognition_state()
+                            else:
+                                self.unknown_frames = max(0, self.unknown_frames - self.UNKNOWN_FRAME_DECAY)
                                 self.known_frames = max(0, self.known_frames - self.KNOWN_FRAME_DECAY)
                                 if self.known_frames == 0:
                                     self.last_recognized_user = None
-                                status_hint = "Unknown user detected. Hold still for registration."
-                                if (
-                                    self.unknown_frames >= self.UNKNOWN_FRAME_THRESHOLD
-                                    and not self.unknown_stable_detected
-                                ):
-                                    self.status_signal.emit(
-                                        "Stable unknown user detected. Prompting for user name..."
-                                    )
-                                    logging.info("Stable unknown user detected.")
-                                    self.unknown_user_detected.emit()
-                                    self.unknown_stable_detected = True
-                            else:
-                                recognized_user = effective_label
-                                self.unknown_frames = max(
-                                    0,
-                                    self.unknown_frames - self.UNKNOWN_FRAME_DECAY,
-                                )
                                 if self.unknown_frames == 0:
                                     self.unknown_stable_detected = False
-                                self.display_user_name = recognized_user
-                                status_hint = "User recognized. Preparing real-time feedback."
-                                if self.last_recognized_user is None:
-                                    self.last_recognized_user = recognized_user
-                                    self.known_frames = max(1, self.known_frames)
-                                elif recognized_user == self.last_recognized_user:
-                                    self.known_frames = min(
-                                        self.KNOWN_FRAME_THRESHOLD,
-                                        self.known_frames + 1,
-                                    )
-                                else:
-                                    self.last_recognized_user = recognized_user
-                                    self.known_frames = max(
-                                        1,
-                                        self.known_frames - self.KNOWN_FRAME_SWITCH_PENALTY,
-                                    )
 
-                                if self.known_frames >= self.KNOWN_FRAME_THRESHOLD:
-                                    logging.info(f"User recognized: {recognized_user}")
-                                    user_info = self.db_handler.get_member_info(recognized_user)
-                                    if not user_info:
-                                        # Edge nodes can have face embeddings before member rows are synced.
-                                        # Auto-create a lightweight local member so analysis can continue.
-                                        provisional_member = {
-                                            "user_id": str(uuid.uuid4()),
-                                            "username": recognized_user,
-                                            "email": "NA",
-                                            "membership": "NA",
-                                            "joined_on": datetime.utcnow().strftime("%Y-%m-%d"),
-                                        }
-                                        try:
-                                            inserted = self.db_handler.insert_member_local(provisional_member)
-                                            user_info = self.db_handler.get_member_info(recognized_user)
-                                            logging.info(
-                                                "Auto-provisioned local member for %s (inserted=%s).",
-                                                recognized_user,
-                                                inserted,
-                                            )
-                                        except Exception as exc:
-                                            logging.error(
-                                                "Failed to auto-provision member %s: %s",
-                                                recognized_user,
-                                                exc,
-                                            )
-                                            user_info = None
+                            recognition_overlay_data = self._build_overlay_data(
+                                metrics={"rep_count": 0, "set_count": 0, "current_weight": 0},
+                                feedback_texts=[],
+                                status_hint=status_hint,
+                            )
 
-                                        if not user_info:
-                                            user_info = provisional_member
-
-                                    self.user_recognized_signal.emit(user_info)
-                                    self.status_signal.emit(
-                                        f"Face recognized as {recognized_user}, starting exercise analysis."
-                                    )
-                                    logging.info(
-                                        f"Starting exercise analysis for user: {recognized_user}"
-                                    )
-                                    self.current_user_info = user_info
-                                    self.display_user_name = recognized_user
-                                    self.exercise_analyzer = ExerciseAnalyzer(
-                                        self.exercise_choice,
-                                        aruco_detector,
-                                        self.db_handler,
-                                        user_id=user_info.get("user_id"),
-                                        username_snapshot=recognized_user,
-                                    )
-                                    self._exit_save_retry_count = 0
-                                    self._analysis_pose_grace_frames_remaining = self.pose_acquire_grace_frames
-                                    self._last_reliable_pose_ts = time.monotonic()
-                                    self.exercise_analysis_active = True
-                                    self.face_recognition_active = False
-                                    self._reset_face_recognition_state()
-                        else:
-                            self.unknown_frames = max(0, self.unknown_frames - self.UNKNOWN_FRAME_DECAY)
-                            self.known_frames = max(0, self.known_frames - self.KNOWN_FRAME_DECAY)
-                            if self.known_frames == 0:
-                                self.last_recognized_user = None
-                            if self.unknown_frames == 0:
-                                self.unknown_stable_detected = False
-
-                        overlay_data = self._build_overlay_data(
-                            metrics={"rep_count": 0, "set_count": 0, "current_weight": 0},
-                            feedback_texts=[],
-                            status_hint=status_hint,
-                        )
-                        self._draw_live_overlay(display_frame, overlay_data, [])
-
-                        self.frame_signal.emit(display_frame)
-                        self.thumbnail_frame_signal.emit(
-                            cv2.resize(display_frame, (160, 90), interpolation=cv2.INTER_AREA)
-                        )
+                        if self._visual_output_due(now):
+                            self._draw_cached_face_boxes_if_recent(display_frame, now)
+                            overlay_data = recognition_overlay_data or self._build_overlay_data(
+                                metrics={"rep_count": 0, "set_count": 0, "current_weight": 0},
+                                feedback_texts=[],
+                                status_hint="Stand in front of the camera for recognition.",
+                            )
+                            self._draw_live_overlay(display_frame, overlay_data, [])
+                            self._emit_visual_outputs(display_frame, now)
                     except Exception as e:
                         self.status_signal.emit("Face recognition error.")
                         logging.error(f"Face recognition error: {e}")
 
-                self.msleep(10)
+                self._sleep_to_target_loop(loop_started_at)
         finally:
             if cap is not None:
                 cap.release()

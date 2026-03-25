@@ -213,6 +213,10 @@ class DatabaseHandler:
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_exercise_timestamp ON exercise_data(timestamp)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_exercise_name ON exercise_data(exercise)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_exercise_sync_status ON exercise_data(sync_status)")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exercise_user_date_name "
+            "ON exercise_data(user_id, date, exercise)"
+        )
         self.connection.commit()
 
     def _setup_postgres_schema(self):
@@ -281,6 +285,10 @@ class DatabaseHandler:
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_exercise_timestamp ON exercise_data(timestamp DESC)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_exercise_name ON exercise_data(exercise)")
         self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_exercise_sync_status ON exercise_data(sync_status)")
+        self.cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_exercise_user_date_name "
+            "ON exercise_data(user_id, date, exercise)"
+        )
         self._ensure_postgres_exercise_data_columns()
         self.cursor.execute("ALTER TABLE exercise_data ALTER COLUMN mirror_id SET DEFAULT gen_random_uuid()")
         self.cursor.execute("UPDATE exercise_data SET mirror_id = gen_random_uuid() WHERE mirror_id IS NULL")
@@ -657,6 +665,132 @@ class DatabaseHandler:
     def get_all_members(self):
         return self.get_all_members_local()
 
+    def _fetch_member_ids_by_usernames(self, usernames):
+        clean_names = sorted(
+            {
+                str(name).strip()
+                for name in (usernames or [])
+                if str(name).strip()
+            }
+        )
+        if not clean_names:
+            return {}
+
+        try:
+            with self.lock:
+                if self.backend == "postgres":
+                    self.cursor.execute(
+                        """
+                        SELECT username, user_id
+                        FROM members
+                        WHERE username = ANY(%s)
+                        """,
+                        (clean_names,),
+                    )
+                else:
+                    placeholders = ",".join(["?"] * len(clean_names))
+                    self.cursor.execute(
+                        f"""
+                        SELECT username, user_id
+                        FROM members
+                        WHERE username IN ({placeholders})
+                        """,
+                        tuple(clean_names),
+                    )
+                rows = self.cursor.fetchall()
+                return {
+                    str(row[0]): str(row[1])
+                    for row in rows
+                    if row and row[0] and row[1]
+                }
+        except Exception as exc:
+            logger.error("Database error in _fetch_member_ids_by_usernames: %s", exc)
+            return {}
+
+    @retry_db_operation
+    def _bulk_upsert_members(self, members):
+        prepared = []
+        for member in members or []:
+            username = (member.get("username") or "").strip()
+            if not username:
+                continue
+            user_id = self._normalize_uuid(member.get("user_id")) or str(uuid.uuid4())
+            prepared.append(
+                (
+                    user_id,
+                    username,
+                    member.get("email", "NA"),
+                    member.get("membership", "NA"),
+                    self._to_date_str(member.get("joined_on")),
+                    (member.get("first_name") or "").strip() or None,
+                    (member.get("last_name") or "").strip() or None,
+                    (member.get("phone") or "").strip() or None,
+                    (member.get("gender") or "").strip() or None,
+                    self._to_date_str(member.get("date_of_birth"))
+                    if member.get("date_of_birth")
+                    else None,
+                    self._safe_float(member.get("height_cm")),
+                    self._safe_float(member.get("weight_kg")),
+                    member.get("password_hash"),
+                )
+            )
+        if not prepared:
+            return 0
+
+        with self.lock:
+            if self.backend == "postgres":
+                self.cursor.executemany(
+                    """
+                    INSERT INTO members (
+                        user_id, username, email, membership, joined_on,
+                        first_name, last_name, phone, gender, date_of_birth,
+                        height_cm, weight_kg, password_hash
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (username) DO UPDATE
+                    SET email = EXCLUDED.email,
+                        membership = EXCLUDED.membership,
+                        joined_on = EXCLUDED.joined_on,
+                        first_name = EXCLUDED.first_name,
+                        last_name = EXCLUDED.last_name,
+                        phone = EXCLUDED.phone,
+                        gender = EXCLUDED.gender,
+                        date_of_birth = EXCLUDED.date_of_birth,
+                        height_cm = EXCLUDED.height_cm,
+                        weight_kg = EXCLUDED.weight_kg,
+                        password_hash = EXCLUDED.password_hash,
+                        updated_at = NOW()
+                    """,
+                    prepared,
+                )
+            else:
+                self.cursor.executemany(
+                    """
+                    INSERT INTO members (
+                        user_id, username, email, membership, joined_on,
+                        first_name, last_name, phone, gender, date_of_birth,
+                        height_cm, weight_kg, password_hash
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(username) DO UPDATE SET
+                        email = excluded.email,
+                        membership = excluded.membership,
+                        joined_on = excluded.joined_on,
+                        first_name = excluded.first_name,
+                        last_name = excluded.last_name,
+                        phone = excluded.phone,
+                        gender = excluded.gender,
+                        date_of_birth = excluded.date_of_birth,
+                        height_cm = excluded.height_cm,
+                        weight_kg = excluded.weight_kg,
+                        password_hash = excluded.password_hash,
+                        updated_at = datetime('now')
+                    """,
+                    prepared,
+                )
+                self.connection.commit()
+        return len(prepared)
+
     def _normalize_exercise_record(self, record):
         rec_id = self._normalize_uuid(record.get("id"))
         if not rec_id:
@@ -909,6 +1043,121 @@ class DatabaseHandler:
     def get_exercise_data_for_user(self, user_id):
         return self.get_exercise_data_for_user_local(user_id)
 
+    def get_daily_exercise_progress(self, user_id, exercise=None, date_str=None):
+        user_id_norm = self._normalize_uuid(user_id)
+        if not user_id_norm:
+            return {
+                "user_id": None,
+                "exercise": (exercise or "").strip(),
+                "date": self._to_date_str(date_str),
+                "set_count": 0,
+                "rep_count": 0,
+            }
+
+        target_date = self._to_date_str(date_str or datetime.now().strftime("%Y-%m-%d"))
+        exercise_filter = (exercise or "").strip().lower()
+        total_sets = 0
+        total_reps = 0
+        try:
+            with self.lock:
+                if self.backend == "postgres":
+                    params = [user_id_norm, target_date]
+                    exercise_clause = ""
+                    if exercise_filter:
+                        exercise_clause = " AND LOWER(exercise) = %s"
+                        params.append(exercise_filter)
+                    self.cursor.execute(
+                        f"""
+                        SELECT
+                            COALESCE(
+                                SUM(
+                                    CASE
+                                        WHEN jsonb_typeof(sets_reps) = 'array'
+                                             AND jsonb_array_length(sets_reps) > 0
+                                        THEN jsonb_array_length(sets_reps)
+                                        ELSE GREATEST(set_count, 0)
+                                    END
+                                ),
+                                0
+                            ) AS total_sets,
+                            COALESCE(
+                                SUM(
+                                    CASE
+                                        WHEN jsonb_typeof(sets_reps) = 'array'
+                                             AND jsonb_array_length(sets_reps) > 0
+                                        THEN (
+                                            SELECT COALESCE(
+                                                SUM(
+                                                    CASE
+                                                        WHEN value ~ '^-?\\d+$'
+                                                        THEN GREATEST(value::int, 0)
+                                                        ELSE 0
+                                                    END
+                                                ),
+                                                0
+                                            )
+                                            FROM jsonb_array_elements_text(sets_reps) AS arr(value)
+                                        )
+                                        WHEN jsonb_typeof(rep_data) = 'array'
+                                        THEN jsonb_array_length(rep_data)
+                                        ELSE 0
+                                    END
+                                ),
+                                0
+                            ) AS total_reps
+                        FROM exercise_data
+                        WHERE user_id = %s
+                          AND date = %s
+                          {exercise_clause}
+                        """,
+                        tuple(params),
+                    )
+                    row = self.cursor.fetchone() or (0, 0)
+                    total_sets = int(row[0] or 0)
+                    total_reps = int(row[1] or 0)
+                else:
+                    query = """
+                        SELECT set_count, sets_reps, rep_data
+                        FROM exercise_data
+                        WHERE user_id = ?
+                          AND date = ?
+                    """
+                    params = [user_id_norm, target_date]
+                    if exercise_filter:
+                        query += " AND LOWER(exercise) = ?"
+                        params.append(exercise_filter)
+                    self.cursor.execute(query, tuple(params))
+                    rows = self.cursor.fetchall()
+                    for row in rows:
+                        sets_reps = self._json_load(row[1], [])
+                        session_set_count = len(sets_reps or [])
+                        if session_set_count <= 0:
+                            try:
+                                session_set_count = max(0, int(row[0] or 0))
+                            except (TypeError, ValueError):
+                                session_set_count = 0
+                        total_sets += session_set_count
+
+                        if sets_reps:
+                            for set_reps in sets_reps:
+                                try:
+                                    total_reps += max(0, int(set_reps or 0))
+                                except (TypeError, ValueError):
+                                    continue
+                        else:
+                            rep_data = self._json_load(row[2], [])
+                            total_reps += len(rep_data or [])
+        except Exception as exc:
+            logger.error("Database error in get_daily_exercise_progress: %s", exc)
+
+        return {
+            "user_id": user_id_norm,
+            "exercise": (exercise or "").strip(),
+            "date": target_date,
+            "set_count": int(total_sets),
+            "rep_count": int(total_reps),
+        }
+
     def get_pending_exercise_data(self, limit=500):
         limit = max(1, int(limit))
         try:
@@ -1014,18 +1263,30 @@ class DatabaseHandler:
         return True
 
     def upsert_edge_records(self, records, source_edge_ip=None, return_record_ids=False):
-        applied = 0
-        applied_record_ids = []
-        for record in records or []:
+        incoming_records = list(records or [])
+        if not incoming_records:
+            if return_record_ids:
+                return 0, []
+            return 0
+
+        existing_member_ids = self._fetch_member_ids_by_usernames(
+            (
+                (record.get("username_snapshot") or record.get("username") or "").strip()
+                for record in incoming_records
+            )
+        )
+        pending_member_rows = {}
+        prepared_records = []
+
+        for record in incoming_records:
             user_id = self._normalize_uuid(record.get("user_id"))
             username = (record.get("username_snapshot") or record.get("username") or "").strip()
 
-            canonical_user_id = user_id
-            existing_member = self.get_member_info_local(username) if username else None
-            if existing_member:
-                existing_user_id = self._normalize_uuid(existing_member.get("user_id"))
-                if existing_user_id:
-                    canonical_user_id = existing_user_id
+            canonical_user_id = existing_member_ids.get(username) if username else None
+            if not canonical_user_id and username in pending_member_rows:
+                canonical_user_id = pending_member_rows[username]["user_id"]
+            if not canonical_user_id:
+                canonical_user_id = user_id
 
             if not username and canonical_user_id:
                 username = f"user_{canonical_user_id[:8]}"
@@ -1038,15 +1299,17 @@ class DatabaseHandler:
                         user_id,
                         canonical_user_id,
                     )
-                self.insert_member_local(
-                    {
-                        "user_id": canonical_user_id,
-                        "username": username,
-                        "email": record.get("email", "NA"),
-                        "membership": record.get("membership", "NA"),
-                        "joined_on": self._to_date_str(record.get("date") or record.get("timestamp")),
-                    }
-                )
+                if username not in existing_member_ids:
+                    pending_member_rows.setdefault(
+                        username,
+                        {
+                            "user_id": canonical_user_id,
+                            "username": username,
+                            "email": record.get("email", "NA"),
+                            "membership": record.get("membership", "NA"),
+                            "joined_on": self._to_date_str(record.get("date") or record.get("timestamp")),
+                        },
+                    )
             elif not canonical_user_id:
                 logger.warning(
                     "Skipping edge record id=%s because canonical user_id could not be resolved.",
@@ -1070,7 +1333,17 @@ class DatabaseHandler:
                 )
                 continue
             merged.setdefault("sync_status", "PENDING")
+            prepared_records.append(merged)
 
+        if pending_member_rows:
+            upserted_count = self._bulk_upsert_members(list(pending_member_rows.values()))
+            logger.debug("Bulk upserted %s member row(s) from edge payload.", upserted_count)
+            for username, member_row in pending_member_rows.items():
+                existing_member_ids[username] = member_row["user_id"]
+
+        applied = 0
+        applied_record_ids = []
+        for merged in prepared_records:
             if self.insert_exercise_data_local(merged):
                 applied += 1
                 if merged.get("id"):
@@ -1093,7 +1366,7 @@ class DatabaseHandler:
             with self.lock:
                 self.cursor.execute("SELECT COUNT(*) FROM members")
                 count = int(self.cursor.fetchone()[0] or 0)
-                logger.info("Total members: %s", count)
+                logger.debug("Total members: %s", count)
                 return count
         except Exception as exc:
             logger.error("Database error in get_total_members: %s", exc)
@@ -1104,7 +1377,7 @@ class DatabaseHandler:
             with self.lock:
                 self.cursor.execute("SELECT COUNT(DISTINCT exercise) FROM exercise_data")
                 count = int(self.cursor.fetchone()[0] or 0)
-                logger.info("Active exercises: %s", count)
+                logger.debug("Active exercises: %s", count)
                 return count
         except Exception as exc:
             logger.error("Database error in get_active_exercises: %s", exc)
@@ -1117,8 +1390,15 @@ class DatabaseHandler:
                 if self.backend == "postgres":
                     self.cursor.execute(
                         """
-                        SELECT members.username, exercise_data.exercise, exercise_data.set_count,
-                               exercise_data.rep_data, exercise_data.timestamp
+                        SELECT members.username,
+                               exercise_data.exercise,
+                               exercise_data.set_count,
+                               CASE
+                                   WHEN jsonb_typeof(exercise_data.rep_data) = 'array'
+                                   THEN jsonb_array_length(exercise_data.rep_data)
+                                   ELSE 0
+                               END AS rep_count,
+                               exercise_data.timestamp
                         FROM exercise_data
                         JOIN members ON exercise_data.user_id = members.user_id
                         ORDER BY exercise_data.timestamp DESC
@@ -1142,17 +1422,19 @@ class DatabaseHandler:
                 rows = self.cursor.fetchall()
                 activities = []
                 for row in rows:
-                    rep_data = row[3] if self.backend == "postgres" else self._json_load(row[3], [])
+                    rep_count = int(row[3] or 0) if self.backend == "postgres" else len(
+                        self._json_load(row[3], []) or []
+                    )
                     activities.append(
                         {
                             "username": row[0],
                             "exercise": row[1],
                             "set_count": int(row[2] or 0),
-                            "rep_count": len(rep_data or []),
+                            "rep_count": rep_count,
                             "timestamp": self._parse_timestamp(row[4]),
                         }
                     )
-                logger.info("Retrieved %s recent activities.", len(activities))
+                logger.debug("Retrieved %s recent activities.", len(activities))
                 return activities
         except Exception as exc:
             logger.error("Error in get_recent_activities: %s", exc)
@@ -1163,7 +1445,7 @@ class DatabaseHandler:
             with self.lock:
                 self.cursor.execute("SELECT COALESCE(SUM(set_count), 0) FROM exercise_data")
                 count = int(self.cursor.fetchone()[0] or 0)
-                logger.info("Total sets: %s", count)
+                logger.debug("Total sets: %s", count)
                 return count
         except Exception as exc:
             logger.error("Database error in get_total_sets: %s", exc)
@@ -1172,14 +1454,73 @@ class DatabaseHandler:
     def get_total_reps(self):
         try:
             with self.lock:
-                self.cursor.execute("SELECT rep_data FROM exercise_data")
-                rows = self.cursor.fetchall()
-                total_reps = 0
-                for row in rows:
-                    rep_data = row[0] if self.backend == "postgres" else self._json_load(row[0], [])
-                    total_reps += len(rep_data or [])
-                logger.info("Total reps: %s", total_reps)
+                if self.backend == "postgres":
+                    self.cursor.execute(
+                        """
+                        SELECT COALESCE(
+                            SUM(
+                                CASE
+                                    WHEN jsonb_typeof(rep_data) = 'array'
+                                    THEN jsonb_array_length(rep_data)
+                                    ELSE 0
+                                END
+                            ),
+                            0
+                        )
+                        FROM exercise_data
+                        """
+                    )
+                    total_reps = int(self.cursor.fetchone()[0] or 0)
+                else:
+                    self.cursor.execute("SELECT rep_data FROM exercise_data")
+                    rows = self.cursor.fetchall()
+                    total_reps = 0
+                    for row in rows:
+                        rep_data = self._json_load(row[0], [])
+                        total_reps += len(rep_data or [])
+                logger.debug("Total reps: %s", total_reps)
                 return total_reps
         except Exception as exc:
             logger.error("Database error in get_total_reps: %s", exc)
             return 0
+
+    def get_dashboard_stats(self):
+        try:
+            with self.lock:
+                if self.backend == "postgres":
+                    self.cursor.execute(
+                        """
+                        SELECT
+                            (SELECT COUNT(*) FROM members) AS total_members,
+                            (SELECT COUNT(DISTINCT exercise) FROM exercise_data) AS active_exercises,
+                            (SELECT COALESCE(SUM(set_count), 0) FROM exercise_data) AS total_sets,
+                            (
+                                SELECT COALESCE(
+                                    SUM(
+                                        CASE
+                                            WHEN jsonb_typeof(rep_data) = 'array'
+                                            THEN jsonb_array_length(rep_data)
+                                            ELSE 0
+                                        END
+                                    ),
+                                    0
+                                )
+                                FROM exercise_data
+                            ) AS total_reps
+                        """
+                    )
+                    row = self.cursor.fetchone() or (0, 0, 0, 0)
+                    return {
+                        "total_members": int(row[0] or 0),
+                        "active_exercises": int(row[1] or 0),
+                        "total_sets": int(row[2] or 0),
+                        "total_reps": int(row[3] or 0),
+                    }
+        except Exception as exc:
+            logger.error("Database error in get_dashboard_stats: %s", exc)
+        return {
+            "total_members": self.get_total_members(),
+            "active_exercises": self.get_active_exercises(),
+            "total_sets": self.get_total_sets(),
+            "total_reps": self.get_total_reps(),
+        }

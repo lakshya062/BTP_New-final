@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime, timezone
 
 import requests
+from requests.adapters import HTTPAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,10 @@ class MainToServerSyncClient:
     def __init__(self, db_handler, sync_config):
         self.db_handler = db_handler
         self.sync_config = sync_config or {}
+        self._session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
 
     def is_enabled(self):
         return bool(self.sync_config.get("enabled", False))
@@ -146,7 +151,7 @@ class MainToServerSyncClient:
         record_ids = [item.get("id") for item in normalized_records if item.get("id")]
 
         try:
-            response = requests.post(
+            response = self._session.post(
                 url,
                 data=json.dumps(payload),
                 headers=headers,
@@ -172,3 +177,9 @@ class MainToServerSyncClient:
             logger.error("Main->Server sync error: %s", exc)
             self.db_handler.mark_exercise_data_synced(record_ids, status="FAILED")
             return False, str(exc), 0
+
+    def close(self):
+        try:
+            self._session.close()
+        except Exception:
+            pass

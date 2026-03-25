@@ -17,6 +17,8 @@ class MemberListPage(QWidget):
         super().__init__()
         self.db_handler = db_handler
         self.face_recognizer = face_recognizer
+        self._members_signature = None
+        self._columns_sized = False
 
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
@@ -85,10 +87,25 @@ class MemberListPage(QWidget):
         # Load Members Initially
         self.load_members()
 
-    def load_members(self):
+    def load_members(self, force=False):
         """Load members from the database and populate the table."""
         try:
             members = self.db_handler.get_all_members()  # Ensure this calls the local method
+            signature = tuple(
+                (
+                    m.get("user_id", ""),
+                    m.get("username", ""),
+                    m.get("email", ""),
+                    m.get("membership", ""),
+                    m.get("joined_on", ""),
+                )
+                for m in members
+            )
+            if not force and signature == self._members_signature:
+                return
+            self._members_signature = signature
+
+            self.table.setUpdatesEnabled(False)
             self.table.setRowCount(0)
             for m in members:
                 row = self.table.rowCount()
@@ -98,7 +115,10 @@ class MemberListPage(QWidget):
                 self.table.setItem(row, 2, QTableWidgetItem(m.get("membership","NA")))
                 self.table.setItem(row, 3, QTableWidgetItem(m.get("joined_on","N/A")))
                 self.table.setItem(row, 4, QTableWidgetItem(m.get("user_id","")))
-            self.table.resizeColumnsToContents()
+            if not self._columns_sized:
+                self.table.resizeColumnsToContents()
+                self._columns_sized = True
+            self.table.setUpdatesEnabled(True)
             self.stacked.setCurrentIndex(0)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load members: {e}")
@@ -140,7 +160,7 @@ class MemberListPage(QWidget):
     def go_back_to_members(self):
         """Navigate back to the Members List Page."""
         self.stacked.setCurrentIndex(0)
-        self.load_members()
+        self.load_members(force=True)
 
     def delete_member(self):
         """Delete the selected member(s) from DB and face recognition model."""
@@ -170,6 +190,6 @@ class MemberListPage(QWidget):
                             self.table.removeRow(index.row())
                         else:
                             QMessageBox.warning(self, "Delete Member", f"Failed to delete member: {username}")
-                self.load_members()
+                self.load_members(force=True)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An error occurred while deleting members: {e}")

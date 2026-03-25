@@ -5,7 +5,6 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QPixmap, QImage, QFont, QIcon
 from PySide6.QtCore import Qt, Slot, Signal
-import numpy as np
 from ui.audio_feedback import AudioFeedbackPlayer
 from ui.worker import ExerciseWorker
 from core.paths import resource_path
@@ -159,12 +158,15 @@ class ExercisePage(QWidget):
     @Slot(object)
     def update_frame(self, frame):
         try:
-            rgb_image = frame[..., ::-1].copy()
-            h, w, ch = rgb_image.shape
+            h, w, ch = frame.shape
             bytes_per_line = ch * w
-            qimg = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
             pix = QPixmap.fromImage(qimg)
-            scaled_pix = pix.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            scaled_pix = pix.scaled(
+                self.video_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation,
+            )
             self.video_label.setPixmap(scaled_pix)
         except Exception as e:
             self.emit_status_message(f"Error updating frame: {e}")

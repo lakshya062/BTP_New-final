@@ -1,6 +1,6 @@
 import ipaddress
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, QThread, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,11 +18,35 @@ from PySide6.QtWidgets import (
 from core.edge_device_manager import DiscoveredEdgeDevice
 
 
+class _DeviceDiscoveryWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, edge_device_manager, username, password):
+        super().__init__()
+        self.edge_device_manager = edge_device_manager
+        self.username = username
+        self.password = password
+
+    @Slot()
+    def run(self):
+        try:
+            devices = self.edge_device_manager.discover_devices(
+                username=self.username,
+                password=self.password,
+            )
+            self.finished.emit(devices)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class AddDeviceDialog(QDialog):
     def __init__(self, edge_device_manager, parent=None):
         super().__init__(parent)
         self.edge_device_manager = edge_device_manager
         self.discovered_devices = []
+        self._scan_thread = None
+        self._scan_worker = None
 
         self.setWindowTitle("Add Edge Device")
         self.setModal(True)
@@ -115,24 +139,50 @@ class AddDeviceDialog(QDialog):
         if not username:
             self.status_label.setText("Enter SSH username before scanning.")
             return
+        if self._scan_thread and self._scan_thread.isRunning():
+            return
 
         self.scan_button.setEnabled(False)
         if password:
             self.status_label.setText("Scanning network interfaces for SSH devices (with Linux verification)...")
         else:
             self.status_label.setText("Scanning network interfaces for SSH devices (without Linux verification)...")
-        try:
-            devices = self.edge_device_manager.discover_devices(
-                username=username,
-                password=password,
-            )
-            self._set_discovered_devices(devices)
-        except Exception as exc:
-            self.device_dropdown.clear()
-            self.discovered_devices = []
-            self.status_label.setText(f"Device scan failed: {exc}")
-        finally:
-            self.scan_button.setEnabled(True)
+
+        self._scan_thread = QThread(self)
+        self._scan_worker = _DeviceDiscoveryWorker(
+            self.edge_device_manager,
+            username=username,
+            password=password,
+        )
+        self._scan_worker.moveToThread(self._scan_thread)
+        self._scan_thread.started.connect(self._scan_worker.run)
+        self._scan_worker.finished.connect(self._on_scan_finished)
+        self._scan_worker.failed.connect(self._on_scan_failed)
+        self._scan_worker.finished.connect(self._scan_thread.quit)
+        self._scan_worker.failed.connect(self._scan_thread.quit)
+        self._scan_thread.finished.connect(self._cleanup_scan_thread)
+        self._scan_thread.start()
+
+    @Slot(object)
+    def _on_scan_finished(self, devices):
+        self._set_discovered_devices(devices)
+        self.scan_button.setEnabled(True)
+
+    @Slot(str)
+    def _on_scan_failed(self, error_text):
+        self.device_dropdown.clear()
+        self.discovered_devices = []
+        self.status_label.setText(f"Device scan failed: {error_text}")
+        self.scan_button.setEnabled(True)
+
+    @Slot()
+    def _cleanup_scan_thread(self):
+        if self._scan_worker:
+            self._scan_worker.deleteLater()
+        if self._scan_thread:
+            self._scan_thread.deleteLater()
+        self._scan_worker = None
+        self._scan_thread = None
 
     def _set_discovered_devices(self, devices):
         self.discovered_devices = list(devices)
@@ -219,3 +269,9 @@ class AddDeviceDialog(QDialog):
             return getpass.getuser()
         except Exception:
             return ""
+
+    def closeEvent(self, event):
+        if self._scan_thread and self._scan_thread.isRunning():
+            self._scan_thread.quit()
+            self._scan_thread.wait(2000)
+        super().closeEvent(event)

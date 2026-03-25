@@ -13,6 +13,9 @@ class HomePage(QWidget):
     def __init__(self, db_handler, parent=None):
         super().__init__(parent)
         self.db_handler = db_handler
+        self._recent_activities_signature = None
+        self._summary_cache = None
+        self._recent_columns_sized = False
         self.init_ui()
 
     def init_ui(self):
@@ -140,6 +143,21 @@ class HomePage(QWidget):
     def load_recent_activities(self):
         """Load recent activities from the database."""
         activities = self.db_handler.get_recent_activities(limit=5)
+        signature = tuple(
+            (
+                activity.get("username", ""),
+                activity.get("exercise", ""),
+                int(activity.get("set_count", 0) or 0),
+                int(activity.get("rep_count", 0) or 0),
+                str(activity.get("timestamp", "")),
+            )
+            for activity in activities
+        )
+        if signature == self._recent_activities_signature:
+            return
+        self._recent_activities_signature = signature
+
+        self.recent_table.setUpdatesEnabled(False)
         self.recent_table.setRowCount(0)
         for activity in activities:
             row = self.recent_table.rowCount()
@@ -149,14 +167,26 @@ class HomePage(QWidget):
             self.recent_table.setItem(row, 2, QTableWidgetItem(str(activity.get("set_count", 0))))
             self.recent_table.setItem(row, 3, QTableWidgetItem(str(activity.get("rep_count", 0))))
             self.recent_table.setItem(row, 4, QTableWidgetItem(activity.get("timestamp", "N/A")))
-        self.recent_table.resizeColumnsToContents()
+        if not self._recent_columns_sized:
+            self.recent_table.resizeColumnsToContents()
+            self._recent_columns_sized = True
+        self.recent_table.setUpdatesEnabled(True)
 
     def refresh_summary(self):
         """Refresh top-level summary cards."""
-        self.members_value.setText(str(self.db_handler.get_total_members()))
-        self.exercises_value.setText(str(self.db_handler.get_active_exercises()))
-        self.sets_value.setText(str(self.db_handler.get_total_sets()))
-        self.reps_value.setText(str(self.db_handler.get_total_reps()))
+        stats = self.db_handler.get_dashboard_stats()
+        members = int(stats.get("total_members", 0) or 0)
+        exercises = int(stats.get("active_exercises", 0) or 0)
+        total_sets = int(stats.get("total_sets", 0) or 0)
+        total_reps = int(stats.get("total_reps", 0) or 0)
+        snapshot = (members, exercises, total_sets, total_reps)
+        if snapshot == self._summary_cache:
+            return
+        self._summary_cache = snapshot
+        self.members_value.setText(str(members))
+        self.exercises_value.setText(str(exercises))
+        self.sets_value.setText(str(total_sets))
+        self.reps_value.setText(str(total_reps))
 
     def add_member(self):
         self.add_member_requested.emit()
