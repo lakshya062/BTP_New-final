@@ -4,7 +4,7 @@ import logging
 import os
 from logging.handlers import RotatingFileHandler
 
-from .paths import project_path
+from .paths import state_path
 
 
 def configure_logging():
@@ -17,7 +17,7 @@ def configure_logging():
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 
     file_handler = RotatingFileHandler(
-        project_path("app.log"),
+        state_path("logs", "app.log"),
         maxBytes=5_000_000,
         backupCount=3,
     )

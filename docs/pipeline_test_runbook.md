@@ -1,7 +1,7 @@
-# Smart Gym Pipeline Test Runbook
+# Smart Gym Centralized Runtime Runbook
 
-## Quick Start (Default)
-Use two terminals only.
+## Quick Start
+Use two terminals.
 
 Terminal A:
 ```bash
@@ -16,32 +16,32 @@ python3 app.py
 ```
 
 ## What happens automatically
-- Django server defaults to PostgreSQL (`gym_server_db`) and auto-runs migrations on `runserver`.
-- Main system app defaults to PostgreSQL (`gym_main_db`) and main-node mode.
-- On macOS, TTS audio feedback is disabled by default for stability. To force-enable it, set `SMART_MIRROR_ENABLE_AUDIO_FEEDBACK=1` before `python3 app.py`.
-- Unknown-user flow now asks full registration details (username, email, plus profile fields), stores them in `members`, and uses DB data when recognized later.
-- Local SQLite edge buffer is disabled; all persistence is PostgreSQL-only.
-- When a user exits frame and session data is saved, transfer sync is triggered immediately (no wait for 1-minute timer).
-- Main system sync path remains:
-  - edge data pull (SSH) -> main DB -> server API (`POST /api/ingest/main-batch/`) -> server DB.
+- Django uses PostgreSQL (`gym_server_db`) and auto-runs migrations during `runserver`.
+- The mirror app uses PostgreSQL (`gym_main_db`) in centralized `MAIN` mode only.
+- Exercise sessions are saved locally into the main database and then synced to the server API (`POST /api/ingest/main-batch/`).
+- Unknown-user flow collects full registration details and stores them in `members`.
 
-## Optional: Local edge-mode simulation
-If you want to simulate an edge runtime on the same machine, use a third terminal:
-```bash
-cd Mirror_Code
-export SMART_MIRROR_EDGE_MODE=1
-python3 app.py
-```
+## Portrait display behavior
+- The smart-display output uses a fixed portrait layout:
+  - top `20%`: live status and exercise text
+  - middle `70%`: analyzed camera feed
+  - bottom `10%`: feedback, angle summary, and timestamp
+- Landscape cameras are fitted with aspect preservation instead of vertical stretching.
+- Default fit mode is `cover`, which fills the middle region and crops the sides if needed.
 
-## Edge deploy notes
-- Add Device now supports:
-  - Manual IP entry (if network scan misses an online edge device).
-  - Optional PostgreSQL provisioning on edge during deploy.
-- If PostgreSQL setup is enabled for that device, deploy runs:
-  - `Mirror_Code/scripts/edge_setup_postgres.sh`
-  - Then applies edge schema from `Mirror_Code/resources/sql/edge_schema.sql`.
+## Useful environment variables
+- `SMART_MIRROR_DISPLAY_FIT_MODE=cover|contain`
+- `SMART_MIRROR_CAMERA_ROTATION=0|90|180|270`
+- `SMART_MIRROR_CAMERA_ROTATION_CAM_0=90`
+- `SMART_MIRROR_CAMERA_MIRROR=1`
+- `SMART_MIRROR_SMART_WINDOW_FPS=60`
+- `SMART_MIRROR_TRACKED_USER_HOLD_SECONDS=2.0`
+- `SMART_MIRROR_TARGET_LOCK_ROI_SCALE=1.65`
+- `SMART_MIRROR_TARGET_LOCK_FACE_RECHECK_FRAMES=12`
+- `SMART_MIRROR_TARGET_LOCK_MAX_CENTER_DRIFT=0.42`
+- `SMART_MIRROR_TARGET_LOCK_MAX_SCALE_DRIFT=1.6`
 
-## PostgreSQL credentials used by default
-- `GYM_DB_ENGINE=postgres`
-- `GYM_DB_PASSWORD=admin`
+## PostgreSQL defaults
+- `SMART_MIRROR_PG_DB=gym_main_db`
 - `SMART_MIRROR_PG_PASSWORD=admin`
+- `GYM_DB_PASSWORD=admin`

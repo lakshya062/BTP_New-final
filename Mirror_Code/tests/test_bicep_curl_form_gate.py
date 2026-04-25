@@ -274,6 +274,46 @@ class BicepCurlFormGateTest(unittest.TestCase):
 
         self.assertTrue(metrics.get("down_range_miss"))
 
+    def test_bicep_rep_counts_with_small_angle_margin(self):
+        landmarks = make_landmarks()
+        self.analyzer.stable_start_detected = True
+        self.analyzer.rep_state = 0
+        self.analyzer.side_pose_stable_frames = 12
+
+        down_form = {
+            "form_ok": True,
+            "front_facing": False,
+            "side_pose_detected": True,
+            "active_arm": "left",
+            "rep_angle": 173,
+            "active_wrist_shoulder_ratio": 0.72,
+            "top_position_ok": True,
+            "arm_metrics": {},
+        }
+        up_form = {
+            "form_ok": True,
+            "front_facing": False,
+            "side_pose_detected": True,
+            "active_arm": "left",
+            "rep_angle": 58,
+            "active_wrist_shoulder_ratio": 0.50,
+            "top_position_ok": True,
+            "arm_metrics": {},
+        }
+
+        with patch.object(self.analyzer, "_bicep_curl_form_gate", return_value=down_form):
+            self.analyzer.analyze_exercise_form(landmarks, frame=None)
+        self.assertEqual(self.analyzer.rep_state, 1)
+
+        with patch.object(self.analyzer, "_bicep_curl_form_gate", return_value=up_form):
+            self.analyzer.analyze_exercise_form(landmarks, frame=None)
+        self.assertEqual(self.analyzer.rep_state, 2)
+
+        with patch.object(self.analyzer, "_bicep_curl_form_gate", return_value=down_form):
+            self.analyzer.analyze_exercise_form(landmarks, frame=None)
+        self.assertEqual(self.analyzer.rep_state, 1)
+        self.assertEqual(self.analyzer.rep_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

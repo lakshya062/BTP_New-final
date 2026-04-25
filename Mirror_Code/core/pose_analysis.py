@@ -219,6 +219,11 @@ class ExerciseAnalyzer:
         cfg = exercise_config[self.exercise]
         down_min, down_max = cfg.get("down_range", (0.0, 0.0))
         up_min, up_max = cfg.get("up_range", (0.0, 0.0))
+        count_range_margin = max(0.0, float(cfg.get("count_range_margin", 0.0)))
+        count_down_min = float(down_min) - count_range_margin
+        count_down_max = float(down_max) + count_range_margin
+        count_up_min = float(up_min) - count_range_margin
+        count_up_max = float(up_max) + count_range_margin
         phase_leave_margin = 12.0
 
         if cfg.get("bend_detection"):
@@ -436,6 +441,7 @@ class ExerciseAnalyzer:
         )
         if rep_angle is not None:
             startup_down_min, startup_down_max = down_min, down_max
+            startup_count_down_min, startup_count_down_max = count_down_min, count_down_max
             stable_frames_required = 30
 
             if self.exercise == "bicep_curl":
@@ -445,6 +451,8 @@ class ExerciseAnalyzer:
                 if isinstance(startup_down_range, (list, tuple)) and len(startup_down_range) == 2:
                     startup_down_min = float(startup_down_range[0])
                     startup_down_max = float(startup_down_range[1])
+                    startup_count_down_min = startup_down_min - count_range_margin
+                    startup_count_down_max = startup_down_max + count_range_margin
 
                 stable_frames_required = int(
                     gate_cfg.get("startup_stable_frames_required", 30)
@@ -466,6 +474,8 @@ class ExerciseAnalyzer:
                 if isinstance(startup_down_range, (list, tuple)) and len(startup_down_range) == 2:
                     startup_down_min = float(startup_down_range[0])
                     startup_down_max = float(startup_down_range[1])
+                    startup_count_down_min = startup_down_min - count_range_margin
+                    startup_count_down_max = startup_down_max + count_range_margin
 
                 stable_frames_required = int(
                     gate_cfg.get("startup_stable_frames_required", 18)
@@ -484,7 +494,7 @@ class ExerciseAnalyzer:
             if not self.stable_start_detected:
                 self.rep_left_down_zone = False
                 self.rep_left_up_zone = False
-                if start_form_ready and startup_down_min <= rep_angle <= startup_down_max:
+                if start_form_ready and startup_count_down_min <= rep_angle <= startup_count_down_max:
                     self.stable_frames += 1
                     if self.stable_frames >= max(1, stable_frames_required):
                         self.stable_start_detected = True
@@ -513,7 +523,7 @@ class ExerciseAnalyzer:
                         self.rep_left_up_zone = False
                     else:
                         active_arm = bicep_form["active_arm"]
-                        if self.rep_state == 0 and down_min <= rep_angle <= down_max:
+                        if self.rep_state == 0 and count_down_min <= rep_angle <= count_down_max:
                             self.rep_state = 1
                             self.rep_active_arm = active_arm
                             self.rep_down_wrist_to_shoulder_ratio = bicep_form[
@@ -521,7 +531,7 @@ class ExerciseAnalyzer:
                             ]
                             self.rep_left_down_zone = False
                             self.rep_left_up_zone = False
-                        elif self.rep_state == 1 and up_min <= rep_angle <= up_max:
+                        elif self.rep_state == 1 and count_up_min <= rep_angle <= count_up_max:
                             min_wrist_delta = float(
                                 cfg.get("form_gate", {}).get(
                                     "min_top_wrist_to_shoulder_delta",
@@ -560,7 +570,7 @@ class ExerciseAnalyzer:
                                 )
                         elif self.rep_state == 2:
                             same_arm = active_arm is not None and active_arm == self.rep_active_arm
-                            if same_arm and down_min <= rep_angle <= down_max:
+                            if same_arm and count_down_min <= rep_angle <= count_down_max:
                                 self.rep_state = 1
                                 self.rep_count += 1
                                 self.rep_end_angle = rep_angle
@@ -629,14 +639,14 @@ class ExerciseAnalyzer:
 
                         if (
                             self.rep_state == 0
-                            and down_min <= rep_angle <= down_max
+                            and count_down_min <= rep_angle <= count_down_max
                             and top_position_ok
                         ):
                             self.rep_state = 1
                             self.rep_active_arm = active_side
                             self.rep_left_down_zone = False
                             self.rep_left_up_zone = False
-                        elif self.rep_state == 1 and up_min <= rep_angle <= up_max:
+                        elif self.rep_state == 1 and count_up_min <= rep_angle <= count_up_max:
                             same_side = active_side is not None and (
                                 self.rep_active_arm is None or active_side == self.rep_active_arm
                             )
@@ -660,7 +670,7 @@ class ExerciseAnalyzer:
                             same_side = active_side is not None and active_side == self.rep_active_arm
                             if (
                                 same_side
-                                and down_min <= rep_angle <= down_max
+                                and count_down_min <= rep_angle <= count_down_max
                                 and top_position_ok
                             ):
                                 self.rep_state = 1
@@ -684,7 +694,7 @@ class ExerciseAnalyzer:
                                 self.rep_started_at_utc = None
                                 self.rep_left_down_zone = False
                                 self.rep_left_up_zone = False
-                            elif same_side and down_min <= rep_angle <= down_max and not top_position_ok:
+                            elif same_side and count_down_min <= rep_angle <= count_down_max and not top_position_ok:
                                 self.down_range_miss_flash_frames = max(
                                     self.down_range_miss_flash_frames,
                                     24,
@@ -725,14 +735,14 @@ class ExerciseAnalyzer:
                         self.rep_start_angle = None
                         self.rep_left_down_zone = False
                         self.rep_left_up_zone = False
-                    elif self.rep_state == 1 and up_min <= rep_angle <= up_max:
+                    elif self.rep_state == 1 and count_up_min <= rep_angle <= count_up_max:
                         self.rep_state = 2
                         self.rep_start_angle = rep_angle
                         self.rep_started_ts = time.time()
                         self.rep_started_at_utc = datetime.utcnow().isoformat()
                         self.rep_left_down_zone = False
                         self.rep_left_up_zone = False
-                    elif self.rep_state == 2 and down_min <= rep_angle <= down_max:
+                    elif self.rep_state == 2 and count_down_min <= rep_angle <= count_down_max:
                         self.rep_state = 1
                         self.rep_count += 1
                         self.rep_end_angle = rep_angle
@@ -814,9 +824,9 @@ class ExerciseAnalyzer:
             if not has_activity:
                 return None
 
+            # Persist only completed sets here. Any in-progress work remains visible
+            # through rep_data, but it should not be treated as another finished set.
             sets_reps = [int(rep) for rep in self.sets_reps]
-            if self.rep_count > 0:
-                sets_reps.append(int(self.rep_count))
             session_set_count = len(sets_reps)
             if session_set_count <= 0:
                 session_set_count = max(0, int(self.set_count) - int(self.starting_set_count))
@@ -848,7 +858,7 @@ class ExerciseAnalyzer:
                 "gym_id": os.getenv("SMART_MIRROR_GYM_ID"),
                 "main_system_id": os.getenv("SMART_MIRROR_MAIN_SYSTEM_ID"),
                 "mirror_id": mirror_id,
-                "source_node": os.getenv("SMART_MIRROR_NODE_ROLE", "EDGE"),
+                "source_node": os.getenv("SMART_MIRROR_NODE_ROLE", "MAIN"),
                 "equipment_type": "FREE_WEIGHT",
             }
 

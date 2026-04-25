@@ -6,7 +6,11 @@ import os
 import numpy as np
 import h5py
 import logging
+import shutil
 import threading
+from pathlib import Path
+
+from core.paths import project_path, state_path
 
 logger = logging.getLogger(__name__)
 
@@ -14,10 +18,47 @@ FRAME_SCALE = 0.25
 MATCH_TOLERANCE = 0.45
 MIN_MATCH_MARGIN = 0.03
 MAX_ENCODINGS_PER_USER = 80
+DEFAULT_FACE_MODEL_FILENAME = "trained_model.hdf5"
+FACE_MODEL_PATH_ENV = "SMART_MIRROR_FACE_MODEL_PATH"
 
 
-def load_trained_model_hdf5(model_path="trained_model.hdf5"):
+def resolve_face_model_path(model_path=None):
+    configured_path = str(model_path or os.getenv(FACE_MODEL_PATH_ENV) or "").strip()
+    if configured_path:
+        resolved_path = Path(configured_path).expanduser()
+        if not resolved_path.is_absolute():
+            resolved_path = Path(project_path(configured_path))
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        return str(resolved_path)
+
+    runtime_model_path = Path(state_path("models", DEFAULT_FACE_MODEL_FILENAME))
+    legacy_model_path = Path(project_path(DEFAULT_FACE_MODEL_FILENAME))
+    if not runtime_model_path.exists() and legacy_model_path.exists():
+        try:
+            runtime_model_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy_model_path, runtime_model_path)
+            try:
+                os.chmod(runtime_model_path, 0o600)
+            except OSError:
+                pass
+            logger.info(
+                "Copied legacy face model from %s to %s.",
+                legacy_model_path,
+                runtime_model_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to copy legacy face model from %s to %s: %s",
+                legacy_model_path,
+                runtime_model_path,
+                exc,
+            )
+    return str(runtime_model_path)
+
+
+def load_trained_model_hdf5(model_path=None):
     """Load known face encodings and names from an HDF5 file."""
+    model_path = resolve_face_model_path(model_path)
     known_face_encodings = []
     known_face_names = []
     if not os.path.exists(model_path):
@@ -151,8 +192,9 @@ def process_frame(args): #this can be done on mobiel app.
         return frame, [], []
 
 
-def append_user_to_model_hdf5(user_name, face_encodings, model_path="trained_model.hdf5"):
+def append_user_to_model_hdf5(user_name, face_encodings, model_path=None):
     """Append a new user's encodings to the HDF5 model."""
+    model_path = resolve_face_model_path(model_path)
     if not face_encodings:
         logger.warning("No face encodings provided for user %s.", user_name)
         return False
@@ -189,8 +231,9 @@ def append_user_to_model_hdf5(user_name, face_encodings, model_path="trained_mod
         return False
 
 
-def delete_user_from_model_hdf5(user_name, model_path="trained_model.hdf5"):
+def delete_user_from_model_hdf5(user_name, model_path=None):
     """Delete a user and their encodings from the HDF5 model."""
+    model_path = resolve_face_model_path(model_path)
     if not os.path.exists(model_path):
         logger.warning("Model file %s does not exist.", model_path)
         return False
@@ -209,8 +252,8 @@ def delete_user_from_model_hdf5(user_name, model_path="trained_model.hdf5"):
 
 
 class FaceRecognizer:
-    def __init__(self, model_path="trained_model.hdf5"):
-        self.model_path = model_path
+    def __init__(self, model_path=None):
+        self.model_path = resolve_face_model_path(model_path)
         self._lock = threading.RLock()
         self.known_face_encodings = []
         self.known_face_names = []
@@ -275,6 +318,41 @@ class FaceRecognizer:
         except Exception as e:
             logger.error("Error in recognize_faces: %s", e)
             return frame, [], []
+
+    def export_user_encodings(self, user_name):
+        normalized_name = str(user_name or "").strip()
+        if not normalized_name:
+            return []
+
+        with self._lock:
+            if not os.path.exists(self.model_path):
+                return []
+            try:
+                with h5py.File(self.model_path, "r") as model_file:
+                    if normalized_name not in model_file:
+                        return []
+                    encodings = np.asarray(
+                        model_file[f"{normalized_name}/encodings"][:],
+                        dtype=np.float32,
+                    )
+                    if encodings.ndim == 1 and encodings.size:
+                        encodings = encodings.reshape(1, -1)
+                    return [np.asarray(encoding, dtype=np.float32) for encoding in encodings]
+            except Exception as exc:
+                logger.error("Failed to export face encodings for %s: %s", normalized_name, exc)
+                return None
+
+    def restore_user_from_backup(self, user_name, face_encodings):
+        normalized_name = str(user_name or "").strip()
+        encodings = list(face_encodings or [])
+        if not normalized_name or not encodings:
+            return True
+
+        with self._lock:
+            success = append_user_to_model_hdf5(normalized_name, encodings, self.model_path)
+            if success:
+                self.reload_model()
+            return success
 
     def register_new_user(self, user_name, face_encodings):
         """Register a new user by appending their encodings to the model."""

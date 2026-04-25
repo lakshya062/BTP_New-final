@@ -15,4 +15,4 @@ fi
 
 "${psql_cmd[@]}" -d postgres -f infra/postgres/drop_databases.sql
 
-echo "Dropped gym_edge_db, gym_main_db, gym_server_db."
+echo "Dropped gym_main_db and gym_server_db."

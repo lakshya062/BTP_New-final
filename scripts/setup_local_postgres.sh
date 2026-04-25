@@ -146,20 +146,13 @@ ensure_database() {
     "ALTER DATABASE \"${db_name}\" OWNER TO \"${APP_DB_USER}\"" >/dev/null
 }
 
-echo "Ensuring databases exist (gym_edge_db, gym_main_db, gym_server_db)..."
-ensure_database "gym_edge_db"
+echo "Ensuring databases exist (gym_main_db, gym_server_db)..."
 ensure_database "gym_main_db"
 ensure_database "gym_server_db"
 
 export PGPASSWORD="$APP_DB_PASSWORD"
 app_psql_cmd=(psql -U "$APP_DB_USER" -h "$APP_DB_HOST" -p "$APP_DB_PORT")
 "${app_psql_cmd[@]}" -d postgres -c "SELECT 1;" >/dev/null
-
-echo "Applying edge schema..."
-"${app_psql_cmd[@]}" -d gym_edge_db -f infra/postgres/edge_schema.sql
-"${app_psql_cmd[@]}" -d gym_edge_db -c \
-  "ALTER TABLE exercise_data ALTER COLUMN mirror_id SET DEFAULT gen_random_uuid();
-   UPDATE exercise_data SET mirror_id = gen_random_uuid() WHERE mirror_id IS NULL;" >/dev/null
 
 echo "Applying main schema..."
 "${app_psql_cmd[@]}" -d gym_main_db -f infra/postgres/main_schema.sql

@@ -1,3 +1,26 @@
-# Ignore virtual environment
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
 gymstartup/
-Mirror_Code/Testing/rtmpose_env
+
+# Build / distribution folders
+dist/
+build/
+
+# Ignore Testing folder inside Mirror_Code
+Mirror_Code/Testing/
+
+# Separate repos inside this folder, do not track from parent repo
+Gym_App/
+gym_backend/
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/

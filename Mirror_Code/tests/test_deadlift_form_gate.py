@@ -163,6 +163,53 @@ class DeadliftFormGateTest(unittest.TestCase):
         self.assertEqual(self.analyzer.rep_state, 1)
         self.assertEqual(self.analyzer.rep_count, 1)
 
+    def test_deadlift_rep_counts_with_small_angle_margin(self):
+        landmarks = make_landmarks()
+        self.analyzer.stable_start_detected = True
+        self.analyzer.rep_state = 0
+        self.analyzer.side_pose_stable_frames = 10
+
+        top_form = {
+            "form_ok": True,
+            "startup_form_ok": True,
+            "front_facing": False,
+            "side_pose_detected": True,
+            "side_pose_votes": 3,
+            "active_side": "left",
+            "rep_angle": 155,
+            "startup_active_side": "left",
+            "startup_rep_angle": 155,
+            "top_position_ok": True,
+            "startup_top_position_ok": True,
+            "bottom_position_ok": False,
+            "active_knee_angle": 166,
+            "startup_knee_angle": 166,
+            "active_torso_lean_angle": 20,
+            "startup_torso_lean_angle": 20,
+            "side_metrics": {},
+        }
+        bottom_form = {
+            **top_form,
+            "rep_angle": 125,
+            "top_position_ok": False,
+            "bottom_position_ok": True,
+            "active_knee_angle": 120,
+            "active_torso_lean_angle": 48,
+        }
+
+        with patch.object(self.analyzer, "_deadlift_form_gate", return_value=top_form):
+            self.analyzer.analyze_exercise_form(landmarks, frame=None)
+        self.assertEqual(self.analyzer.rep_state, 1)
+
+        with patch.object(self.analyzer, "_deadlift_form_gate", return_value=bottom_form):
+            self.analyzer.analyze_exercise_form(landmarks, frame=None)
+        self.assertEqual(self.analyzer.rep_state, 2)
+
+        with patch.object(self.analyzer, "_deadlift_form_gate", return_value=top_form):
+            self.analyzer.analyze_exercise_form(landmarks, frame=None)
+        self.assertEqual(self.analyzer.rep_state, 1)
+        self.assertEqual(self.analyzer.rep_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

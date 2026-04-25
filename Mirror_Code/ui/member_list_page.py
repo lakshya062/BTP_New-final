@@ -1,5 +1,7 @@
 # ui/member_list_page.py
 
+import logging
+
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem, 
     QPushButton, QHBoxLayout, QLabel, QStackedWidget, QMessageBox, QLineEdit
@@ -162,6 +164,43 @@ class MemberListPage(QWidget):
         self.stacked.setCurrentIndex(0)
         self.load_members(force=True)
 
+    def _delete_member_transactionally(self, username):
+        face_backup = self.face_recognizer.export_user_encodings(username)
+        if face_backup is None:
+            return False, (
+                f"Could not read the face model for '{username}'. "
+                "Delete was canceled to avoid an inconsistent member state."
+            )
+
+        deleted_from_face_model = False
+        if face_backup:
+            if not self.face_recognizer.delete_user_from_model(username):
+                return False, (
+                    f"Could not delete the face profile for '{username}'. "
+                    "The member record was left unchanged."
+                )
+            deleted_from_face_model = True
+
+        if self.db_handler.delete_member_local(username):
+            return True, f"Member '{username}' deleted successfully."
+
+        if deleted_from_face_model:
+            restored = self.face_recognizer.restore_user_from_backup(username, face_backup)
+            if not restored:
+                logging.error(
+                    "Failed to restore face model for %s after database deletion rollback.",
+                    username,
+                )
+                return False, (
+                    f"Database deletion failed for '{username}', and the face profile could not be restored automatically. "
+                    "Manual repair is required."
+                )
+
+        return False, (
+            f"Failed to delete member '{username}'. "
+            "Any removed face profile was restored automatically."
+        )
+
     def delete_member(self):
         """Delete the selected member(s) from DB and face recognition model."""
         try:
@@ -176,20 +215,22 @@ class MemberListPage(QWidget):
                 QMessageBox.No
             )
             if reply == QMessageBox.Yes:
+                successes = []
+                failures = []
                 for index in sorted(selected_rows, reverse=True):
                     username = self.table.item(index.row(), 0).text()
-                    user_id = self.table.item(index.row(), 4).text()
-                    if username and user_id:
-                        success = self.db_handler.delete_member_local(username)  # Ensure this calls the local method
-                        if success:
-                            delete_success = self.face_recognizer.delete_user_from_model(username)
-                            if delete_success:
-                                QMessageBox.information(self, "Delete Member", f"Member '{username}' deleted successfully.")
-                            else:
-                                QMessageBox.warning(self, "Delete Member", f"Failed to delete member from face model: {username}")
-                            self.table.removeRow(index.row())
-                        else:
-                            QMessageBox.warning(self, "Delete Member", f"Failed to delete member: {username}")
+                    if not username:
+                        continue
+                    success, message = self._delete_member_transactionally(username)
+                    if success:
+                        successes.append(message)
+                        self.table.removeRow(index.row())
+                    else:
+                        failures.append(message)
+                if successes:
+                    QMessageBox.information(self, "Delete Member", "\n".join(successes))
+                if failures:
+                    QMessageBox.warning(self, "Delete Member", "\n".join(failures))
                 self.load_members(force=True)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An error occurred while deleting members: {e}")

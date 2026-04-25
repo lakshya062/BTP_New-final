@@ -77,7 +77,7 @@ class MainToServerSyncClient:
         except Exception:
             rec["set_count"] = 0
 
-        rec["source_node"] = (rec.get("source_node") or "EDGE")
+        rec["source_node"] = (rec.get("source_node") or "MAIN")
         rec["equipment_type"] = (rec.get("equipment_type") or "FREE_WEIGHT")
         if not rec.get("source_edge_ip") and rec.get("source_Edge_ip"):
             rec["source_edge_ip"] = rec.get("source_Edge_ip")

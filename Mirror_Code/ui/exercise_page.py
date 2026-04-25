@@ -12,6 +12,7 @@ from core.paths import resource_path
 class ExercisePage(QWidget):
     status_message = Signal(str)
     counters_update = Signal(int, int)
+    display_state_update = Signal(object)
     user_recognized_signal = Signal(dict)
     unknown_user_detected = Signal(object)
     new_user_registration_signal = Signal(str, bool)
@@ -103,6 +104,7 @@ class ExercisePage(QWidget):
                 aruco_dict_type=self.aruco_dict_type,
             )
             self.worker.frame_signal.connect(self.update_frame)
+            self.worker.display_state_signal.connect(self.emit_display_state_update)
             self.worker.status_signal.connect(self.emit_status_message)
             self.worker.counters_signal.connect(self.emit_counters_update)
             self.worker.user_recognized_signal.connect(self.handle_user_recognized)
@@ -122,6 +124,7 @@ class ExercisePage(QWidget):
         if self.worker:
             try:
                 self.worker.frame_signal.disconnect(self.update_frame)
+                self.worker.display_state_signal.disconnect(self.emit_display_state_update)
                 self.worker.status_signal.disconnect(self.emit_status_message)
                 self.worker.counters_signal.disconnect(self.emit_counters_update)
                 self.worker.user_recognized_signal.disconnect(self.handle_user_recognized)
@@ -201,6 +204,10 @@ class ExercisePage(QWidget):
         self.counters_update.emit(reps, sets)  # <-- forwards to any external connections
         self.rep_label.setText(f"Reps: {reps}")
         self.set_label.setText(f"Sets: {sets}")
+
+    @Slot(object)
+    def emit_display_state_update(self, payload):
+        self.display_state_update.emit(payload)
 
     @Slot(dict)
     def handle_user_recognized(self, user_info):

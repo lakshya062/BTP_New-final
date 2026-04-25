@@ -1,6 +1,0 @@
-rtmpose_env/
-.cache/
-.cache_yolo11/
-.cache_openpose/
-__pycache__/
-*.pyc

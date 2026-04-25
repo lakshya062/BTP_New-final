@@ -157,7 +157,7 @@ class DatabaseHandler:
                 gym_id TEXT,
                 main_system_id TEXT,
                 mirror_id TEXT,
-                source_node TEXT DEFAULT 'EDGE',
+                source_node TEXT DEFAULT 'MAIN',
                 equipment_type TEXT DEFAULT 'FREE_WEIGHT',
                 machine_id TEXT,
                 sync_status TEXT DEFAULT 'PENDING',
@@ -189,7 +189,7 @@ class DatabaseHandler:
             "gym_id": "TEXT",
             "main_system_id": "TEXT",
             "mirror_id": "TEXT",
-            "source_node": "TEXT DEFAULT 'EDGE'",
+            "source_node": "TEXT DEFAULT 'MAIN'",
             "equipment_type": "TEXT DEFAULT 'FREE_WEIGHT'",
             "machine_id": "TEXT",
             "sync_status": "TEXT DEFAULT 'PENDING'",
@@ -266,7 +266,7 @@ class DatabaseHandler:
                 gym_id UUID,
                 main_system_id UUID,
                 mirror_id UUID,
-                source_node TEXT NOT NULL DEFAULT 'EDGE',
+                source_node TEXT NOT NULL DEFAULT 'MAIN',
                 equipment_type TEXT NOT NULL DEFAULT 'FREE_WEIGHT',
                 machine_id UUID,
                 sync_status TEXT NOT NULL DEFAULT 'PENDING',
@@ -433,10 +433,10 @@ class DatabaseHandler:
         except Exception:
             return default
 
-    def _edge_role_default(self):
-        role = os.getenv("SMART_MIRROR_NODE_ROLE", "EDGE").strip().upper()
+    def _source_role_default(self):
+        role = os.getenv("SMART_MIRROR_NODE_ROLE", "MAIN").strip().upper()
         if role not in {"EDGE", "MAIN"}:
-            return "EDGE"
+            return "MAIN"
         return role
 
     @staticmethod
@@ -826,7 +826,7 @@ class DatabaseHandler:
                 record.get("main_system_id") or os.getenv("SMART_MIRROR_MAIN_SYSTEM_ID")
             ),
             "mirror_id": mirror_id,
-            "source_node": (record.get("source_node") or self._edge_role_default()).upper(),
+            "source_node": (record.get("source_node") or self._source_role_default()).upper(),
             "equipment_type": (record.get("equipment_type") or "FREE_WEIGHT").upper(),
             "machine_id": self._normalize_uuid(record.get("machine_id")),
             "sync_status": (record.get("sync_status") or "PENDING").upper(),
@@ -1083,6 +1083,9 @@ class DatabaseHandler:
                             COALESCE(
                                 SUM(
                                     CASE
+                                        WHEN jsonb_typeof(rep_data) = 'array'
+                                             AND jsonb_array_length(rep_data) > 0
+                                        THEN jsonb_array_length(rep_data)
                                         WHEN jsonb_typeof(sets_reps) = 'array'
                                              AND jsonb_array_length(sets_reps) > 0
                                         THEN (
@@ -1098,8 +1101,6 @@ class DatabaseHandler:
                                             )
                                             FROM jsonb_array_elements_text(sets_reps) AS arr(value)
                                         )
-                                        WHEN jsonb_typeof(rep_data) = 'array'
-                                        THEN jsonb_array_length(rep_data)
                                         ELSE 0
                                     END
                                 ),
@@ -1138,15 +1139,15 @@ class DatabaseHandler:
                                 session_set_count = 0
                         total_sets += session_set_count
 
-                        if sets_reps:
+                        rep_data = self._json_load(row[2], [])
+                        if rep_data:
+                            total_reps += len(rep_data or [])
+                        elif sets_reps:
                             for set_reps in sets_reps:
                                 try:
                                     total_reps += max(0, int(set_reps or 0))
                                 except (TypeError, ValueError):
                                     continue
-                        else:
-                            rep_data = self._json_load(row[2], [])
-                            total_reps += len(rep_data or [])
         except Exception as exc:
             logger.error("Database error in get_daily_exercise_progress: %s", exc)
 

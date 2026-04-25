@@ -13,6 +13,7 @@ exercise_config = {
         'rep_angle_keys': ['left_elbow', 'right_elbow'],
         'down_range': (150, 170),  # Fully extended
         'up_range': (35, 55),      # Fully contracted
+        'count_range_margin': 3.0,
         'reps_per_set': 12,
         'bend_detection': True,
         'form_gate': {
@@ -27,10 +28,10 @@ exercise_config = {
             'max_side_shoulder_to_torso_ratio': 0.72,
             'required_side_pose_frames': 8,
             # Keep upper arm close to torso (strict curl mechanics).
-            'max_underarm_angle': 48,
-            'max_elbow_hip_distance_ratio': 0.58,
-            'max_elbow_shoulder_x_ratio': 0.32,
-            'min_elbow_drop_ratio': 0.12,
+            'max_underarm_angle': 50,
+            'max_elbow_hip_distance_ratio': 0.60,
+            'max_elbow_shoulder_x_ratio': 0.34,
+            'min_elbow_drop_ratio': 0.10,
             # Looser startup gate so "ready" is easier to achieve before first rep.
             'startup_required_side_pose_frames': 4,
             'startup_stable_frames_required': 14,
@@ -40,9 +41,9 @@ exercise_config = {
             'startup_max_elbow_shoulder_x_ratio': 0.40,
             'startup_min_elbow_drop_ratio': 0.06,
             # At top of rep, wrist should approach shoulder (true curl path).
-            'max_wrist_to_shoulder_ratio_at_top': 0.62,
-            'max_top_wrist_shoulder_x_ratio': 0.26,
-            'min_top_wrist_to_shoulder_delta': 0.08,
+            'max_wrist_to_shoulder_ratio_at_top': 0.66,
+            'max_top_wrist_shoulder_x_ratio': 0.29,
+            'min_top_wrist_to_shoulder_delta': 0.06,
             'min_arm_visibility': 0.35,
             'min_valid_arms': 1,
         },
@@ -57,6 +58,7 @@ exercise_config = {
         'rep_angle_keys': ['left_hip', 'right_hip'],
         'down_range': (158, 180),   # Standing lockout
         'up_range': (78, 122),      # Bottom hinge
+        'count_range_margin': 3.0,
         'reps_per_set': 8,
         'bend_detection': False,
         'form_gate': {
@@ -76,20 +78,20 @@ exercise_config = {
             'startup_down_range': (150, 180),
             # Tracking quality and movement constraints.
             'min_side_visibility': 0.42,
-            'max_tracking_torso_lean': 78,
-            'min_tracking_hip_angle': 60,
-            'min_tracking_knee_angle': 65,
+            'max_tracking_torso_lean': 80,
+            'min_tracking_hip_angle': 58,
+            'min_tracking_knee_angle': 63,
             # Top lockout validation.
-            'top_hip_angle_min': 158,
-            'top_knee_angle_min': 154,
-            'max_top_torso_lean': 30,
+            'top_hip_angle_min': 156,
+            'top_knee_angle_min': 152,
+            'max_top_torso_lean': 32,
             'startup_top_hip_angle_min': 150,
             'startup_top_knee_angle_min': 148,
             'startup_max_top_torso_lean': 34,
             # Bottom hinge validation.
-            'bottom_hip_angle_range': (74, 126),
-            'bottom_knee_angle_range': (78, 145),
-            'bottom_torso_lean_range': (28, 74),
+            'bottom_hip_angle_range': (72, 128),
+            'bottom_knee_angle_range': (76, 147),
+            'bottom_torso_lean_range': (26, 76),
         },
     },
     'seated_shoulder_press': {

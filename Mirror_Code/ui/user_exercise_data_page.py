@@ -165,7 +165,8 @@ class UserExerciseDataPage(QWidget):
             self.sessions_table.insertRow(row)
             self.sessions_table.setItem(row, 0, QTableWidgetItem(session['exercise']))
             self.sessions_table.setItem(row, 1, QTableWidgetItem(str(session['set_count'])))
-            total_reps = sum(session['sets_reps']) if session['sets_reps'] else 0
+            rep_data = session.get('rep_data') or []
+            total_reps = len(rep_data) if rep_data else sum(session['sets_reps']) if session['sets_reps'] else 0
             self.sessions_table.setItem(row, 2, QTableWidgetItem(str(total_reps)))
             self.sessions_table.setItem(row, 3, QTableWidgetItem(session['date'] if session['date'] else ''))
             self.sessions_table.setItem(row, 4, QTableWidgetItem(session['timestamp'] if session['timestamp'] else ''))

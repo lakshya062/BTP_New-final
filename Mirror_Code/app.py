@@ -4,13 +4,12 @@ import sys
 import os
 import faulthandler
 import warnings
-import signal
 from datetime import datetime
 from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen
 from PySide6.QtGui import QIcon, QPixmap
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from core.logging_config import configure_logging
-from core.paths import project_path, resource_path
+from core.paths import resource_path, state_path
 from ui.main_window import MainWindow
 
 _fault_log_file = None
@@ -19,7 +18,7 @@ _fault_log_file = None
 def _configure_runtime_diagnostics():
     global _fault_log_file
     try:
-        fault_log_path = project_path("edge_fault.log")
+        fault_log_path = state_path("logs", "mirror_fault.log")
         _fault_log_file = open(fault_log_path, "a", buffering=1)
         _fault_log_file.write(
             f"\n=== Session {datetime.utcnow().isoformat()}Z pid={os.getpid()} ===\n"
@@ -28,7 +27,7 @@ def _configure_runtime_diagnostics():
     except Exception:
         _fault_log_file = None
 
-    # Keep edge runtime logs clean; this warning is non-fatal and very noisy.
+    # Keep runtime logs clean; this warning is non-fatal and very noisy.
     warnings.filterwarnings(
         "ignore",
         message=r".*SymbolDatabase\.GetPrototype\(\) is deprecated.*",
@@ -42,9 +41,6 @@ def main():
         _configure_runtime_diagnostics()
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
         app = QApplication(sys.argv)
-        is_edge_mode = os.environ.get("SMART_MIRROR_EDGE_MODE", "0") == "1"
-        if is_edge_mode:
-            app.setQuitOnLastWindowClosed(False)
         app.setApplicationName("Smart Gym Client System")
         app.setOrganizationName("SmartGym")
         app.setOrganizationDomain("smartgym.com")
@@ -54,15 +50,13 @@ def main():
         if os.path.exists(icon_path):
             app.setWindowIcon(QIcon(icon_path))
 
-        # Optional: Add splash screen on main desktop app only.
-        if not is_edge_mode:
-            splash_path = resource_path("icons", "splash.png")
-            splash_pix = QPixmap(splash_path) if os.path.exists(splash_path) else QPixmap()
-            if not splash_pix.isNull():
-                splash = QSplashScreen(splash_pix, Qt.WindowStaysOnTopHint)
-                splash.setMask(splash_pix.mask())
-                splash.show()
-                app.processEvents()
+        splash_path = resource_path("icons", "splash.png")
+        splash_pix = QPixmap(splash_path) if os.path.exists(splash_path) else QPixmap()
+        if not splash_pix.isNull():
+            splash = QSplashScreen(splash_pix, Qt.WindowStaysOnTopHint)
+            splash.setMask(splash_pix.mask())
+            splash.show()
+            app.processEvents()
 
         stylesheet_path = resource_path("styles.qss")
         if os.path.exists(stylesheet_path):
@@ -140,38 +134,10 @@ def main():
             """)
 
         window = MainWindow()
-        if is_edge_mode:
-            # Edge runtime should only show live camera feed window.
-            window.hide()
-        else:
-            window.show()
-
-        if is_edge_mode:
-            shutdown_state = {"requested": False}
-
-            def _request_graceful_shutdown(signum, _frame):
-                if shutdown_state["requested"]:
-                    return
-                shutdown_state["requested"] = True
-                print(f"Received signal {signum}; shutting down edge runtime gracefully...")
-
-                def _graceful_stop():
-                    try:
-                        window._shutdown_runtime()
-                    except Exception as exc:
-                        print(f"Edge graceful shutdown error: {exc}")
-                    app.quit()
-
-                QTimer.singleShot(0, _graceful_stop)
-
-            signal.signal(signal.SIGTERM, _request_graceful_shutdown)
-            signal.signal(signal.SIGINT, _request_graceful_shutdown)
+        window.show()
 
         if 'splash' in locals():
-            if not is_edge_mode:
-                splash.finish(window)
-            else:
-                splash.close()
+            splash.finish(window)
 
         sys.exit(app.exec())
     

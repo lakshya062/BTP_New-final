@@ -1,0 +1,7 @@
+# Runtime Python packages for the Django backend container.
+# Database/image startup behavior is handled by the Dockerfile and entrypoint.
+Django==5.2.9
+django-cors-headers==4.9.0
+djangorestframework==3.16.1
+psycopg2-binary==2.9.11
+bcrypt==5.0.0
