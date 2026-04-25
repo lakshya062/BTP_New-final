@@ -14,7 +14,7 @@ from PySide6.QtCore import QThread, Signal
 
 from core.aruco_detection import ArucoDetector
 from core.pose_analysis import ExerciseAnalyzer
-from core.config import exercise_config
+from core.config import exercise_config, get_exercise_display_name
 from ui.coaching import motivation_line, range_miss_message
 from ui.edge_utils import open_camera_capture
 from ui.live_overlay import draw_live_overlay
@@ -561,6 +561,7 @@ class ExerciseWorker(QThread):
 
         cfg = exercise_config.get(self.exercise_choice, {})
         reps_per_set = int(cfg.get("reps_per_set", 12))
+        range_labels = cfg.get("range_labels", {})
         rep_angle_raw = metrics.get("rep_angle")
         rep_angle = float(rep_angle_raw) if rep_angle_raw is not None else None
 
@@ -593,7 +594,7 @@ class ExerciseWorker(QThread):
 
         return {
             "username": self._resolve_user_name(),
-            "exercise": self.exercise_choice.replace("_", " ").title(),
+            "exercise": get_exercise_display_name(self.exercise_choice),
             "rep_count": reps,
             "set_count": sets_done,
             "current_weight": current_weight,
@@ -618,14 +619,18 @@ class ExerciseWorker(QThread):
             "rep_state": rep_state,
             "up_range_miss": up_range_miss,
             "down_range_miss": down_range_miss,
-            "up_range_label": "BOTTOM" if self.exercise_choice == "deadlift" else "UP",
-            "down_range_label": "LOCKOUT" if self.exercise_choice == "deadlift" else "DOWN",
+            "up_range_label": range_labels.get(
+                "up",
+                "BOTTOM" if self.exercise_choice == "deadlift" else "UP",
+            ),
+            "down_range_label": range_labels.get(
+                "down",
+                "LOCKOUT" if self.exercise_choice == "deadlift" else "DOWN",
+            ),
             "show_range_bars": (
-                self.exercise_choice in {"bicep_curl", "deadlift"}
+                bool(up_range and down_range)
                 and stable_start_detected
                 and rep_angle is not None
-                and up_range is not None
-                and down_range is not None
             ),
         }
 

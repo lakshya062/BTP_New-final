@@ -20,7 +20,7 @@ from functools import partial
 from core.database import DatabaseHandler
 from core.face_recognition import FaceRecognizer
 from core.aruco_detection import ArucoDetector
-from core.config import exercise_config
+from core.config import exercise_config, get_exercise_display_name
 from core.edge_device_manager import EdgeDeviceManager
 from core.paths import project_path, resource_path
 from core.server_sync import MainToServerSyncClient
@@ -899,7 +899,7 @@ class MainWindow(QMainWindow):
         exercise_page.new_user_registration_signal.connect(self.handle_new_user_registration_result)
         exercise_page.worker_started.connect(lambda: self.connect_data_updated_signal(exercise_page))
 
-        tab_label = f"{exercise.replace('_', ' ').title()} (cam_{camera_index})"
+        tab_label = f"{get_exercise_display_name(exercise)} (cam_{camera_index})"
         self.tabs.addTab(exercise_page, QIcon(resource_path("icons", "exercise.png")), tab_label)
         self.exercise_pages.append((exercise_page, camera_index, exercise, user_name))
 
@@ -1071,7 +1071,7 @@ class MainWindow(QMainWindow):
         if missing:
             msg = "Some cameras are not connected:\n"
             for (ci, ex) in missing:
-                msg += f"cam_{ci} for exercise {ex.replace('_', ' ').title()}\n"
+                msg += f"cam_{ci} for exercise {get_exercise_display_name(ex)}\n"
             msg += "The remaining cameras will be started."
             if self.is_edge_mode:
                 logging.warning(msg)

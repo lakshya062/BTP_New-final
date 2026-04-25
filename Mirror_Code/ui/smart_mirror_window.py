@@ -2,6 +2,8 @@ import logging
 import os
 import time
 
+from core.config import get_exercise_display_name
+
 import cv2
 import numpy as np
 from PySide6.QtCore import Qt
@@ -153,7 +155,7 @@ class SmartMirrorWindow(QMainWindow):
 
         reps, sets_done = self.exercise_counters.get((camera_index, exercise), (0, 0))
         header_text = (
-            f"cam_{camera_index} | {exercise.replace('_', ' ').title()} | "
+            f"cam_{camera_index} | {get_exercise_display_name(exercise)} | "
             f"Reps {reps} | Sets {sets_done}"
         )
         banner_margin = 24

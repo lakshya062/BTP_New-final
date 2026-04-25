@@ -3,6 +3,8 @@
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem, QFrame
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtCore import Qt, Signal
+
+from core.config import get_exercise_display_name
 from core.paths import resource_path
 
 class HomePage(QWidget):
@@ -163,7 +165,11 @@ class HomePage(QWidget):
             row = self.recent_table.rowCount()
             self.recent_table.insertRow(row)
             self.recent_table.setItem(row, 0, QTableWidgetItem(activity.get("username", "N/A")))
-            self.recent_table.setItem(row, 1, QTableWidgetItem(activity.get("exercise", "N/A").replace('_', ' ').title()))
+            self.recent_table.setItem(
+                row,
+                1,
+                QTableWidgetItem(get_exercise_display_name(activity.get("exercise", "N/A"))),
+            )
             self.recent_table.setItem(row, 2, QTableWidgetItem(str(activity.get("set_count", 0))))
             self.recent_table.setItem(row, 3, QTableWidgetItem(str(activity.get("rep_count", 0))))
             self.recent_table.setItem(row, 4, QTableWidgetItem(activity.get("timestamp", "N/A")))

@@ -1,12 +1,27 @@
+from core.config import exercise_config
+
+
+def _coaching_text(exercise_choice, key, default):
+    return exercise_config.get(exercise_choice, {}).get("coaching", {}).get(key, default)
+
+
 def range_miss_message(exercise_choice, up_range_miss, down_range_miss):
     if up_range_miss:
         if exercise_choice == "deadlift":
             return "Go deeper into the hinge before standing up.", "up"
-        return "Go higher. Reach the top range before lowering.", "up"
+        return _coaching_text(
+            exercise_choice,
+            "up_miss",
+            "Go higher. Reach the top range before lowering.",
+        ), "up"
     if down_range_miss:
         if exercise_choice == "deadlift":
             return "Stand tall at lockout before the next rep.", "down"
-        return "Lower fully. Reach the down range before next rep.", "down"
+        return _coaching_text(
+            exercise_choice,
+            "down_miss",
+            "Lower fully. Reach the down range before next rep.",
+        ), "down"
     return None, None
 
 
@@ -30,11 +45,19 @@ def motivation_line(
     if up_range_miss:
         if is_deadlift:
             return "You are close. Hinge deeper with control before driving up."
-        return "You are close. Lift a little higher and squeeze at the top."
+        return _coaching_text(
+            exercise_choice,
+            "up_miss",
+            "You are close. Lift a little higher and squeeze at the top.",
+        )
     if down_range_miss:
         if is_deadlift:
             return "Strong pull. Finish taller at lockout before the next rep."
-        return "Nice effort. Lower all the way down, then start the next curl."
+        return _coaching_text(
+            exercise_choice,
+            "down_miss",
+            "Nice effort. Lower all the way down, then start the next curl.",
+        )
     if "Set complete!" in feedback_texts:
         return "Great set. Take two deep breaths and get ready for the next round."
     if "Ready to start!" in feedback_texts:
@@ -63,7 +86,11 @@ def motivation_line(
     if stable_start_detected and sets_done == 0 and reps == 0:
         if is_deadlift:
             return "Start position locked. Hinge back smoothly, then stand tall at lockout."
-        return "Start position locked. Curl up with intent and return with control."
+        return _coaching_text(
+            exercise_choice,
+            "start",
+            "Start position locked. Curl up with intent and return with control.",
+        )
     if sets_done > 0 and reps == 0:
         return "Strong previous set. Stay composed and attack this next one."
     if reps_per_set > 0 and reps >= max(1, int(reps_per_set * 0.9)):
@@ -78,12 +105,24 @@ def motivation_line(
         if rep_state == 1:
             if is_deadlift:
                 return "Push the floor away and drive hips forward to stand tall."
-            return "Drive up through the curl. Elbows stay pinned."
+            return _coaching_text(
+                exercise_choice,
+                "phase_up",
+                "Drive up through the curl. Elbows stay pinned.",
+            )
         if rep_state == 2:
             if is_deadlift:
                 return "Control the hinge down. Keep the spine neutral and lats tight."
-            return "Control the way down. Earn the full range."
+            return _coaching_text(
+                exercise_choice,
+                "phase_down",
+                "Control the way down. Earn the full range.",
+            )
         return "Good tempo. Stay smooth and keep tension."
     if status_hint:
         return status_hint
-    return "Stand centered and start when you are ready."
+    return _coaching_text(
+        exercise_choice,
+        "start",
+        "Stand centered and start when you are ready.",
+    )

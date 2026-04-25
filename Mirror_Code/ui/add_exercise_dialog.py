@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QIcon
 from PySide6.QtCore import Qt, QSize
 
-from core.config import exercise_config  # Import exercise_config
+from core.config import get_exercise_display_name, selectable_exercises
 from core.paths import resource_path
 
 class AddExerciseDialog(QDialog):
@@ -32,8 +32,10 @@ class AddExerciseDialog(QDialog):
         exercise_layout = QHBoxLayout()
         exercise_label = QLabel("Select Exercise:")
         self.exercise_combo = QComboBox()
-        # Dynamically populate with available exercises from config
-        self.exercise_combo.addItems([ex.replace('_', ' ').title() for ex in exercise_config.keys()])
+        self.exercise_keys = selectable_exercises()
+        self.exercise_combo.addItems(
+            [get_exercise_display_name(exercise) for exercise in self.exercise_keys]
+        )
         self.exercise_combo.setToolTip("Choose the type of exercise")
         exercise_layout.addWidget(exercise_label)
         exercise_layout.addWidget(self.exercise_combo)
@@ -86,6 +88,6 @@ class AddExerciseDialog(QDialog):
     def get_selection(self):
         """Return the selected camera, exercise, and user."""
         cam_text = self.cam_combo.currentText()
-        exercise = self.exercise_combo.currentText().lower().replace(' ', '_')
+        exercise = self.exercise_keys[self.exercise_combo.currentIndex()]
         user = self.user_combo.currentText()
         return cam_text, exercise, user

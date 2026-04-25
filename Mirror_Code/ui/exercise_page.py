@@ -7,6 +7,7 @@ from PySide6.QtGui import QPixmap, QImage, QFont, QIcon
 from PySide6.QtCore import Qt, Slot, Signal
 from ui.audio_feedback import AudioFeedbackPlayer
 from ui.worker import ExerciseWorker
+from core.config import get_exercise_display_name
 from core.paths import resource_path
 
 class ExercisePage(QWidget):
@@ -38,7 +39,7 @@ class ExercisePage(QWidget):
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
 
-        self.title_label = QLabel(f"Exercise: {self.exercise_choice.replace('_', ' ').title()}")
+        self.title_label = QLabel(f"Exercise: {get_exercise_display_name(self.exercise_choice)}")
         self.title_label.setObjectName("exerciseTitle")
         self.title_label.setFont(QFont("Segoe UI", 16, QFont.Bold))
         self.title_label.setAlignment(Qt.AlignCenter)

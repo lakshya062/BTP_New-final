@@ -9,6 +9,8 @@ import logging
 import os
 import time
 
+from core.config import get_exercise_display_name
+
 class CamerasOverviewPage(QWidget):
     def __init__(self):
         super().__init__()
@@ -82,7 +84,7 @@ class CamerasOverviewPage(QWidget):
         placeholder.fill(Qt.darkGray)
         label_pixmap.setPixmap(placeholder)
 
-        label = QLabel(f"{exercise.replace('_', ' ').title()} (cam_{camera_index})")
+        label = QLabel(f"{get_exercise_display_name(exercise)} (cam_{camera_index})")
         label.setAlignment(Qt.AlignCenter)
         label.setStyleSheet("color: #FFFFFF; font-size: 12pt; margin-top: 5px;")
         label.setFixedHeight(30)
