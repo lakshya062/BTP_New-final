@@ -50,6 +50,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # Adding the first tab emits currentChanged synchronously.
+        self._is_shutting_down = False
 
         self.setWindowTitle("Smart Gym Client System")
         self.setMinimumSize(1600, 1000)
@@ -165,10 +167,10 @@ class MainWindow(QMainWindow):
             "mirror_id": os.getenv("SMART_MIRROR_MIRROR_ID", ""),
         }
         self.server_sync_config = {
-            "enabled": True,
+            "enabled": False,
             "server_url": "http://127.0.0.1:8000",
             "ingest_endpoint": "/api/ingest/main-batch/",
-            "api_key": "local-test-key",
+            "api_key": "",
             "gym_id": "",
             "main_system_id": "",
             "timeout_seconds": 20,
@@ -267,15 +269,17 @@ class MainWindow(QMainWindow):
                 "mirror_id": "",
             },
             "server_sync": {
-                "enabled": bool(server_sync.get("enabled", True)),
-                "server_url": server_sync.get("server_url", "http://127.0.0.1:8000"),
+                # A repository snapshot is not a provisioned device. Sync must
+                # be configured explicitly for this installation.
+                "enabled": False,
+                "server_url": "http://127.0.0.1:8000",
                 "ingest_endpoint": server_sync.get(
                     "ingest_endpoint",
                     "/api/ingest/main-batch/",
                 ),
                 # Device secrets should come from the environment or the new runtime file,
                 # not from a repo-local config snapshot.
-                "api_key": str(os.getenv("SMART_GYM_MAIN_API_KEY") or "").strip() or "local-test-key",
+                "api_key": str(os.getenv("SMART_GYM_MAIN_API_KEY") or "").strip(),
                 "gym_id": "",
                 "main_system_id": "",
                 "timeout_seconds": float(server_sync.get("timeout_seconds", 20)),
@@ -297,7 +301,9 @@ class MainWindow(QMainWindow):
         if not self.system_config.get("mirror_id"):
             self.system_config["mirror_id"] = str(uuid.uuid4())
         self.system_config["node_role"] = "MAIN"
-        self.server_sync_config["enabled"] = bool(self.server_sync_config.get("enabled", True))
+        self.server_sync_config["enabled"] = (
+            self._parse_env_bool(self.server_sync_config.get("enabled", False)) is True
+        )
         self.server_sync_config["gym_id"] = (
             self.server_sync_config.get("gym_id") or self.system_config["gym_id"]
         )
@@ -312,6 +318,20 @@ class MainWindow(QMainWindow):
         os.environ["SMART_MIRROR_MIRROR_ID"] = self.system_config["mirror_id"]
 
     def _apply_server_sync_overrides(self):
+        enabled_override = (
+            os.getenv("SMART_GYM_SERVER_SYNC_ENABLED", "").strip()
+            or os.getenv("SMART_MIRROR_SERVER_SYNC_ENABLED", "").strip()
+        )
+        if enabled_override:
+            parsed_enabled = self._parse_env_bool(enabled_override)
+            if parsed_enabled is None:
+                logging.warning(
+                    "Ignoring invalid server sync enabled value: %s",
+                    enabled_override,
+                )
+            else:
+                self.server_sync_config["enabled"] = parsed_enabled
+
         server_url = os.getenv("SMART_GYM_SERVER_URL", "").strip()
         if server_url:
             self.server_sync_config["server_url"] = server_url
@@ -333,6 +353,15 @@ class MainWindow(QMainWindow):
                     "Ignoring invalid SMART_GYM_SERVER_TIMEOUT_SECONDS value: %s",
                     timeout_override,
                 )
+
+    @staticmethod
+    def _parse_env_bool(value):
+        normalized = str(value or "").strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+        return None
 
     def _mark_dashboard_dirty(
         self,
@@ -510,13 +539,13 @@ class MainWindow(QMainWindow):
                 "mirror_id": system.get("mirror_id", os.getenv("SMART_MIRROR_MIRROR_ID", "")),
             }
             self.server_sync_config = {
-                "enabled": bool(server_sync.get("enabled", True)),
+                "enabled": self._parse_env_bool(server_sync.get("enabled", False)) is True,
                 "server_url": server_sync.get("server_url", "http://127.0.0.1:8000"),
                 "ingest_endpoint": server_sync.get(
                     "ingest_endpoint",
                     "/api/ingest/main-batch/",
                 ),
-                "api_key": server_sync.get("api_key", "local-test-key"),
+                "api_key": server_sync.get("api_key", ""),
                 "gym_id": server_sync.get("gym_id", system.get("gym_id", "")),
                 "main_system_id": server_sync.get(
                     "main_system_id",
@@ -966,7 +995,9 @@ class MainWindow(QMainWindow):
 
         if self._sync_worker and self._sync_worker.isRunning():
             self._sync_worker.requestInterruption()
-            self._sync_worker.wait(3000)
+            # The request may still be inside its configured network timeout.
+            # Join it before closing its DB/session or destroying its Qt parent.
+            self._sync_worker.wait()
 
         for page, _cam_idx, _exercise, _user_name in self.exercise_pages[:]:
             self._disconnect_mirror_feed(page)

@@ -81,6 +81,12 @@ def make_pose_landmark_packet(center_x=0.30, center_y=0.54, width=0.18, height=0
     )
 
 
+def paint_box(frame, box, color):
+    left, top, right, bottom = box
+    frame[top:bottom, left:right] = color
+    return frame
+
+
 @unittest.skipIf(ExerciseWorker is None, "worker dependencies are not installed in this environment")
 class ExerciseWorkerTrackingLockTest(unittest.TestCase):
     def setUp(self):
@@ -234,6 +240,106 @@ class ExerciseWorkerTrackingLockTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "confirmed")
         self.assertFalse(self.worker._should_return_to_face_recognition(11.9))
+
+    def test_session_profile_rejects_same_place_different_appearance_after_lock(self):
+        landmarks = make_pose_landmarks(center_x=0.31, center_y=0.55)
+        pose_lock = self.worker._resolve_pose_lock(landmarks, self.frame.shape)
+        self.worker.locked_body_box = pose_lock["box"]
+        self.worker.locked_body_center = pose_lock["center"]
+        self.worker.locked_body_size = pose_lock["size"]
+        self.worker._pose_lock_established = True
+
+        blue_frame = np.zeros_like(self.frame)
+        paint_box(blue_frame, pose_lock["box"], (255, 0, 0))
+        self.worker._update_session_identity_profile(
+            frame=blue_frame,
+            body_box=pose_lock["box"],
+            face_box=pose_lock["face_box"],
+            now=12.0,
+            strong_identity=True,
+        )
+
+        self.assertTrue(
+            self.worker._accept_pose_for_target_lock(
+                landmarks,
+                self.frame.shape,
+                frame=blue_frame,
+            )
+        )
+
+        red_frame = np.zeros_like(self.frame)
+        paint_box(red_frame, pose_lock["box"], (0, 0, 255))
+
+        self.assertFalse(
+            self.worker._accept_pose_for_target_lock(
+                landmarks,
+                self.frame.shape,
+                frame=red_frame,
+            )
+        )
+
+    def test_missing_center_lock_uses_thirty_second_stale_timeout(self):
+        self.worker.target_lost_since = 10.0
+        self.worker.tracked_user_hold_seconds = 5.0
+        self.worker.tracked_user_missing_timeout_seconds = 30.0
+        self.worker.target_exit_started_since = None
+        self.worker.locked_body_box = (520, 180, 980, 960)
+
+        self.assertFalse(self.worker._should_return_to_face_recognition(39.9, self.frame.shape))
+        self.assertTrue(self.worker._should_return_to_face_recognition(40.1, self.frame.shape))
+
+    def test_missing_status_hint_escalates_to_countdown(self):
+        self.worker.target_lost_since = 10.0
+        self.worker.tracked_user_missing_warning_seconds = 5.0
+        self.worker.tracked_user_stale_countdown_seconds = 15.0
+        self.worker.tracked_user_missing_timeout_seconds = 30.0
+
+        self.assertEqual(self.worker._tracked_user_missing_status_hint("Alice", 13.0), "Waiting for Alice.")
+        self.assertIn("Step back in", self.worker._tracked_user_missing_status_hint("Alice", 17.0))
+        self.assertIn("Session ending in", self.worker._tracked_user_missing_status_hint("Alice", 26.0))
+
+    def test_lock_marker_draws_above_tracked_user(self):
+        frame = np.zeros_like(self.frame)
+
+        drawn = self.worker._draw_tracked_user_lock_marker(frame, now=12.0, paused=False)
+
+        self.assertTrue(drawn)
+        self.assertGreater(int(frame.sum()), 0)
+
+    def test_end_session_palm_requires_hold_duration(self):
+        landmarks = make_pose_landmarks(center_x=0.31, center_y=0.55)
+        left_shoulder = landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+        landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value] = SimpleNamespace(
+            x=left_shoulder.x,
+            y=left_shoulder.y - 0.08,
+            z=0.0,
+            visibility=1.0,
+        )
+        landmarks[mp_pose.PoseLandmark.LEFT_INDEX.value] = SimpleNamespace(
+            x=left_shoulder.x - 0.035,
+            y=left_shoulder.y - 0.14,
+            z=0.0,
+            visibility=1.0,
+        )
+        landmarks[mp_pose.PoseLandmark.LEFT_PINKY.value] = SimpleNamespace(
+            x=left_shoulder.x + 0.035,
+            y=left_shoulder.y - 0.14,
+            z=0.0,
+            visibility=1.0,
+        )
+        landmarks[mp_pose.PoseLandmark.LEFT_THUMB.value] = SimpleNamespace(
+            x=left_shoulder.x - 0.055,
+            y=left_shoulder.y - 0.10,
+            z=0.0,
+            visibility=1.0,
+        )
+
+        complete, hint = self.worker._update_end_session_palm_hold(landmarks, now=20.0)
+        self.assertFalse(complete)
+        self.assertIn("Hold palm to end", hint)
+
+        complete, _hint = self.worker._update_end_session_palm_hold(landmarks, now=23.1)
+        self.assertTrue(complete)
 
     def test_analysis_roi_uses_full_frame_until_pose_lock_is_established(self):
         roi_box = self.worker._resolve_analysis_roi_box(self.frame.shape)

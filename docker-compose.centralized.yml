@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: ${SMART_GYM_DB_PASSWORD:-smartgym}
       POSTGRES_DB: postgres
     ports:
-      - "5432:5432"
+      - "${SMART_GYM_DB_BIND_HOST:-127.0.0.1}:${SMART_GYM_DB_PORT:-5432}:5432"
     volumes:
       - smart-gym-postgres:/var/lib/postgresql/data
     healthcheck:
@@ -20,22 +20,6 @@ services:
       timeout: 5s
       retries: 10
 
-  backend:
-    image: ${SMART_GYM_BACKEND_IMAGE:-smart-gym-backend:portable}
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      GYM_DB_ENGINE: postgres
-      GYM_DB_NAME: gym_server_db
-      GYM_DB_USER: ${SMART_GYM_DB_USER:-smartgym}
-      GYM_DB_PASSWORD: ${SMART_GYM_DB_PASSWORD:-smartgym}
-      GYM_DB_HOST: postgres
-      GYM_DB_PORT: 5432
-    ports:
-      - "8000:8000"
-
   mirror:
     image: ${SMART_GYM_MIRROR_IMAGE:-smart-gym-mirror:portable}
     profiles: ["mirror"]
@@ -44,8 +28,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      backend:
-        condition: service_started
     environment:
       DISPLAY: ${DISPLAY:-:0}
       QT_X11_NO_MITSHM: 1
@@ -56,11 +38,13 @@ services:
       SMART_MIRROR_PG_HOST: postgres
       SMART_MIRROR_PG_PORT: 5432
       SMART_MIRROR_NODE_ROLE: MAIN
-      SMART_GYM_SERVER_URL: http://backend:8000
+      SMART_MIRROR_STATE_DIR: /var/lib/smart-gym
+      SMART_GYM_SERVER_SYNC_ENABLED: 0
       SMART_MIRROR_DISABLE_AUDIO_FEEDBACK: 1
       SMART_MIRROR_DISPLAY_FIT_MODE: ${SMART_MIRROR_DISPLAY_FIT_MODE:-cover}
       SMART_MIRROR_CAMERA_ROTATION: ${SMART_MIRROR_CAMERA_ROTATION:-0}
     volumes:
+      - smart-gym-mirror-state:/var/lib/smart-gym
       - /tmp/.X11-unix:/tmp/.X11-unix
       - /dev:/dev
     stdin_open: true
@@ -68,3 +52,4 @@ services:
 
 volumes:
   smart-gym-postgres:
+  smart-gym-mirror-state:

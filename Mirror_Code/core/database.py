@@ -29,25 +29,28 @@ class DatabaseHandler:
         return cls._instance
 
     def __init__(self, local_db_file=None):
-        if hasattr(self, "_initialized") and self._initialized:
-            return
-        self._initialized = True
-
-        self.local_db_file = local_db_file or ""
-        self.lock = threading.Lock()
-        self.backend = os.getenv("SMART_MIRROR_DB_BACKEND", "postgres").strip().lower()
-        self.connection = None
-        self.cursor = None
-        self._cached_default_mirror_id = None
-
-        if self.backend == "postgres":
-            self._connect_postgres()
-        else:
-            raise RuntimeError(
-                "SQLite backend is disabled. Set SMART_MIRROR_DB_BACKEND=postgres."
-            )
-
-        self.setup_local_db()
+        # __new__ and __init__ can run on different callers concurrently. Publish
+        # initialized state only after connecting and setting up the schema.
+        with self._instance_lock:
+            if getattr(self, "_initialized", False):
+                return
+            self.local_db_file = local_db_file or ""
+            self.lock = threading.Lock()
+            self.backend = os.getenv("SMART_MIRROR_DB_BACKEND", "postgres").strip().lower()
+            self.connection = None
+            self.cursor = None
+            self._cached_default_mirror_id = None
+            try:
+                if self.backend == "postgres":
+                    self._connect_postgres()
+                else:
+                    raise RuntimeError("SQLite backend is disabled. Set SMART_MIRROR_DB_BACKEND=postgres.")
+                self.setup_local_db()
+            except Exception:
+                if self.connection is not None:
+                    self.connection.close()
+                raise
+            self._initialized = True
 
     def _connect_sqlite(self):
         self.connection = sqlite3.connect(
@@ -1236,7 +1239,9 @@ class DatabaseHandler:
             return True
 
         status = (status or "SYNCED").upper()
-        now_iso = datetime.utcnow().isoformat()
+        if status not in {"SYNCED", "FAILED", "PENDING", "QUEUED", "INVALID"}:
+            raise ValueError("Unsupported sync status")
+        now_iso = datetime.utcnow().isoformat() if status == "SYNCED" else None
 
         with self.lock:
             if self.backend == "postgres":
@@ -1244,11 +1249,11 @@ class DatabaseHandler:
                     """
                     UPDATE exercise_data
                     SET sync_status = %s,
-                        synced_at = NOW(),
+                        synced_at = CASE WHEN %s = 'SYNCED' THEN NOW() ELSE NULL END,
                         updated_at = NOW()
                     WHERE id = ANY(%s::uuid[])
                     """,
-                    (status, cleaned_ids),
+                    (status, status, cleaned_ids),
                 )
             else:
                 placeholders = ",".join(["?"] * len(cleaned_ids))
@@ -1358,6 +1363,7 @@ class DatabaseHandler:
             with self.lock:
                 if self.connection:
                     self.connection.close()
+                    self._initialized = False
                     logger.info("Closed database connection.")
         except Exception as exc:
             logger.error("Database close error: %s", exc)

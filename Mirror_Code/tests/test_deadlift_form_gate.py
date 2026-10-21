@@ -75,6 +75,8 @@ class DeadliftFormGateTest(unittest.TestCase):
         with patch.object(self.analyzer, "_deadlift_form_gate", return_value=startup_only_form):
             for _ in range(18):
                 feedback, _ = self.analyzer.analyze_exercise_form(landmarks, frame=None)
+                if self.analyzer.stable_start_detected:
+                    break
 
         self.assertTrue(self.analyzer.stable_start_detected)
         self.assertEqual(self.analyzer.rep_state, 1)

@@ -7,10 +7,10 @@
         "mirror_id": "65e79f0e-8805-5098-b02a-8c9e258d9e73"
     },
     "server_sync": {
-        "enabled": true,
-        "server_url": "http://35.209.207.47:8000",
+        "enabled": false,
+        "server_url": "http://127.0.0.1:8000",
         "ingest_endpoint": "/api/ingest/main-batch/",
-        "api_key": "local-test-key",
+        "api_key": "",
         "gym_id": "36a67fbd-90e3-4aa2-886e-0a8b1b2bd996",
         "main_system_id": "ac48af70-bc2b-43b6-8dad-db987b669276",
         "timeout_seconds": 20.0

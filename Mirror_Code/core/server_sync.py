@@ -1,9 +1,11 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -21,7 +23,10 @@ class MainToServerSyncClient:
         self._session.mount("https://", adapter)
 
     def is_enabled(self):
-        return bool(self.sync_config.get("enabled", False))
+        value = self.sync_config.get("enabled", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     def _server_url(self):
         return str(self.sync_config.get("server_url") or "http://127.0.0.1:8000").rstrip("/")
@@ -34,6 +39,33 @@ class MainToServerSyncClient:
 
     def _api_key(self):
         return str(self.sync_config.get("api_key") or os.getenv("SMART_GYM_MAIN_API_KEY", "")).strip()
+
+    def _validate_config(self):
+        parsed = urlsplit(self._server_url())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.query or parsed.fragment:
+            raise ValueError("Server sync requires a valid HTTP(S) server_url without query or fragment.")
+        if parsed.username or parsed.password:
+            raise ValueError("Server URL must not contain credentials.")
+        if not self._api_key():
+            raise ValueError("Server sync requires a main system API key.")
+        for name, value in (
+            ("gym_id", self.sync_config.get("gym_id") or os.getenv("SMART_MIRROR_GYM_ID")),
+            ("main_system_id", self.sync_config.get("main_system_id") or os.getenv("SMART_MIRROR_MAIN_SYSTEM_ID")),
+        ):
+            try:
+                uuid.UUID(str(value))
+            except (ValueError, TypeError, AttributeError):
+                raise ValueError(f"Server sync requires a valid {name}.") from None
+        timeout = float(self.sync_config.get("timeout_seconds", 20))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Server sync timeout_seconds must be finite and positive.")
+        return timeout
+
+    def _mark_failed(self, record_ids):
+        try:
+            self.db_handler.mark_exercise_data_synced(record_ids, status="FAILED")
+        except Exception:
+            logger.exception("Could not mark failed sync records for retry")
 
     @staticmethod
     def _build_hash(payload_obj):
@@ -56,7 +88,7 @@ class MainToServerSyncClient:
         if isinstance(date_val, str) and date_val.strip().lower() in {"", "none", "null"}:
             date_val = None
         if not date_val:
-            date_val = rec["timestamp"].split("T", 1)[0]
+            date_val = rec["timestamp"].split("T", 1)[0].split(" ", 1)[0]
         rec["date"] = str(date_val)
 
         sets_reps = rec.get("sets_reps")
@@ -117,30 +149,39 @@ class MainToServerSyncClient:
         if not self.is_enabled():
             return True, "Server sync disabled", 0
 
-        records = self.db_handler.get_pending_exercise_data(limit=limit)
+        try:
+            timeout = self._validate_config()
+            records = self.db_handler.get_pending_exercise_data(limit=limit)
+        except Exception as exc:
+            return False, str(exc), 0
         if not records:
             return True, "No pending records", 0
 
-        normalized_records = []
-        dropped_record_ids = []
-        for rec in records:
-            rec_id = rec.get("id")
-            if not rec.get("id") or not rec.get("user_id") or not rec.get("exercise"):
-                if rec_id:
-                    dropped_record_ids.append(rec_id)
-                continue
-            normalized_records.append(self._normalize_record(rec))
+        try:
+            normalized_records = []
+            dropped_record_ids = []
+            for rec in records:
+                rec_id = rec.get("id")
+                if not rec.get("id") or not rec.get("user_id") or not rec.get("exercise"):
+                    if rec_id:
+                        dropped_record_ids.append(rec_id)
+                    continue
+                normalized_records.append(self._normalize_record(rec))
 
-        if dropped_record_ids:
-            # Permanent schema-invalid records should not block retry queue forever.
-            self.db_handler.mark_exercise_data_synced(dropped_record_ids, status="INVALID")
+            if dropped_record_ids:
+                # Permanent schema-invalid records should not block retry queue forever.
+                self.db_handler.mark_exercise_data_synced(dropped_record_ids, status="INVALID")
 
-        if not normalized_records:
-            return True, "No valid pending records", 0
+            if not normalized_records:
+                return True, "No valid pending records", 0
 
-        payload = self.build_batch_payload(normalized_records)
-        if not payload:
-            return True, "No payload generated", 0
+            payload = self.build_batch_payload(normalized_records)
+            if not payload:
+                return True, "No payload generated", 0
+
+        except Exception as exc:
+            logger.error("Could not prepare server sync batch: %s", exc)
+            return False, str(exc), 0
 
         url = f"{self._server_url()}{self._endpoint()}"
         headers = {"Content-Type": "application/json"}
@@ -153,12 +194,13 @@ class MainToServerSyncClient:
         try:
             response = self._session.post(
                 url,
-                data=json.dumps(payload),
+                data=json.dumps(payload, allow_nan=False),
                 headers=headers,
-                timeout=float(self.sync_config.get("timeout_seconds", 20)),
+                timeout=timeout,
+                allow_redirects=False,
             )
-            if response.status_code >= 400:
-                self.db_handler.mark_exercise_data_synced(record_ids, status="FAILED")
+            if response.status_code not in {200, 201}:
+                self._mark_failed(record_ids)
                 return (
                     False,
                     f"Server sync failed HTTP {response.status_code}: {response.text[:300]}",
@@ -166,16 +208,20 @@ class MainToServerSyncClient:
                 )
 
             response_payload = response.json() if response.content else {}
-            if not response_payload.get("success", True):
-                self.db_handler.mark_exercise_data_synced(record_ids, status="FAILED")
-                return False, f"Server rejected payload: {response_payload}", 0
+            if (not isinstance(response_payload, dict)
+                    or response_payload.get("success") is not True
+                    or response_payload.get("status") != "APPLIED"
+                    or str(response_payload.get("batch_id")) != payload["batch_id"]):
+                self._mark_failed(record_ids)
+                return False, "Server did not acknowledge this batch as applied", 0
 
-            self.db_handler.mark_exercise_data_synced(record_ids, status="SYNCED")
+            if not self.db_handler.mark_exercise_data_synced(record_ids, status="SYNCED"):
+                return False, "Server applied batch, but local acknowledgement could not be saved", 0
             synced_count = len(record_ids)
             return True, f"Synced {synced_count} record(s) to server", synced_count
         except Exception as exc:
             logger.error("Main->Server sync error: %s", exc)
-            self.db_handler.mark_exercise_data_synced(record_ids, status="FAILED")
+            self._mark_failed(record_ids)
             return False, str(exc), 0
 
     def close(self):

@@ -1,11 +1,16 @@
 # Smart Gym Centralized Runtime Runbook
 
 ## Quick Start
-Use two terminals.
+Install the Python 3.10/3.11 runtime and configure PostgreSQL using
+[runtime_setup.md](runtime_setup.md). The API is optional for mirror-only use.
+For the full pipeline, use two terminals with the same activated environment.
 
 Terminal A:
 ```bash
 cd gym_backend
+export GYM_DEBUG=1
+# Set GYM_DB_* to your provisioned development database first.
+python3 manage.py migrate
 python3 manage.py runserver 0.0.0.0:8000
 ```
 
@@ -16,9 +21,12 @@ python3 app.py
 ```
 
 ## What happens automatically
-- Django uses PostgreSQL (`gym_server_db`) and auto-runs migrations during `runserver`.
+- Django uses PostgreSQL (`gym_server_db`); apply migrations explicitly before starting it.
 - The mirror app uses PostgreSQL (`gym_main_db`) in centralized `MAIN` mode only.
-- Exercise sessions are saved locally into the main database and then synced to the server API (`POST /api/ingest/main-batch/`).
+- Exercise sessions are saved into the main database. Server sync is disabled by
+  default; provision a controller and its key using the backend README, then set
+  the server URL, matching gym/controller IDs, and `SMART_GYM_SERVER_SYNC_ENABLED=1`.
+  Sync uses `POST /api/ingest/main-batch/` and requires an `APPLIED` acknowledgement.
 - Unknown-user flow collects full registration details and stores them in `members`.
 
 ## Portrait display behavior
@@ -43,5 +51,10 @@ python3 app.py
 
 ## PostgreSQL defaults
 - `SMART_MIRROR_PG_DB=gym_main_db`
-- `SMART_MIRROR_PG_PASSWORD=admin`
-- `GYM_DB_PASSWORD=admin`
+- Set `SMART_MIRROR_PG_USER` and `SMART_MIRROR_PG_PASSWORD` explicitly.
+- Set the optional server's `GYM_DB_USER` and `GYM_DB_PASSWORD` explicitly.
+
+The included backend implements member login/history and controller ingest. Mobile
+owner and signup flows need their separate API endpoints. Member history requires
+the Bearer token returned by login. See `gym_backend/README.md` and
+`Gym_App/README.md` for deployment and client compatibility requirements.

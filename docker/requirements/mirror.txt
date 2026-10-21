@@ -2,8 +2,13 @@
 # dlib and face-recognition are installed in the Dockerfile because they need
 # an architecture-aware source build during image creation.
 numpy==1.26.4
-opencv-python==4.10.0.84
+# MediaPipe and ArUco both need contrib. Installing a second OpenCV wheel
+# overwrites the same cv2 files and can break imports or marker detection.
+opencv-contrib-python==4.10.0.84
 mediapipe==0.10.14
+h5py==3.14.0
 PySide6==6.9.1
 psycopg2-binary==2.9.11
 requests==2.32.3
+# face_recognition_models still imports pkg_resources, removed in setuptools 82.
+setuptools<82

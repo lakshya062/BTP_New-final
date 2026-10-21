@@ -59,9 +59,9 @@ bootstrap_psql() {
   local db="$1"
   shift
   if [[ -n "$BOOTSTRAP_HOST" ]]; then
-    psql -U "$BOOTSTRAP_USER" -h "$BOOTSTRAP_HOST" -p "$PSQL_PORT" -d "$db" "$@"
+    psql -X -v ON_ERROR_STOP=1 -U "$BOOTSTRAP_USER" -h "$BOOTSTRAP_HOST" -p "$PSQL_PORT" -d "$db" "$@"
   else
-    psql -U "$BOOTSTRAP_USER" -p "$PSQL_PORT" -d "$db" "$@"
+    psql -X -v ON_ERROR_STOP=1 -U "$BOOTSTRAP_USER" -p "$PSQL_PORT" -d "$db" "$@"
   fi
 }
 
@@ -116,6 +116,7 @@ bootstrap_psql postgres -c "SELECT 1;" >/dev/null
 
 APP_DB_USER_SQL="${APP_DB_USER//\'/\'\'}"
 APP_DB_PASSWORD_SQL="${APP_DB_PASSWORD//\'/\'\'}"
+APP_DB_USER_IDENTIFIER="${APP_DB_USER//\"/\"\"}"
 
 echo "Ensuring application role '$APP_DB_USER' exists..."
 ROLE_EXISTS="$(
@@ -124,10 +125,10 @@ ROLE_EXISTS="$(
 )"
 if [[ "$ROLE_EXISTS" != "1" ]]; then
   bootstrap_psql postgres -c \
-    "CREATE ROLE \"${APP_DB_USER}\" LOGIN PASSWORD '${APP_DB_PASSWORD_SQL}'"
+    "CREATE ROLE \"${APP_DB_USER_IDENTIFIER}\" LOGIN PASSWORD '${APP_DB_PASSWORD_SQL}'"
 else
   bootstrap_psql postgres -c \
-    "ALTER ROLE \"${APP_DB_USER}\" WITH LOGIN PASSWORD '${APP_DB_PASSWORD_SQL}'"
+    "ALTER ROLE \"${APP_DB_USER_IDENTIFIER}\" WITH LOGIN PASSWORD '${APP_DB_PASSWORD_SQL}'"
 fi
 
 ensure_database() {
@@ -140,10 +141,10 @@ ensure_database() {
   )"
   if [[ "$db_exists" != "1" ]]; then
     bootstrap_psql postgres -c \
-      "CREATE DATABASE \"${db_name}\" OWNER \"${APP_DB_USER}\""
+      "CREATE DATABASE \"${db_name}\" OWNER \"${APP_DB_USER_IDENTIFIER}\""
   fi
   bootstrap_psql postgres -c \
-    "ALTER DATABASE \"${db_name}\" OWNER TO \"${APP_DB_USER}\"" >/dev/null
+    "ALTER DATABASE \"${db_name}\" OWNER TO \"${APP_DB_USER_IDENTIFIER}\"" >/dev/null
 }
 
 echo "Ensuring databases exist (gym_main_db, gym_server_db)..."
@@ -151,7 +152,7 @@ ensure_database "gym_main_db"
 ensure_database "gym_server_db"
 
 export PGPASSWORD="$APP_DB_PASSWORD"
-app_psql_cmd=(psql -U "$APP_DB_USER" -h "$APP_DB_HOST" -p "$APP_DB_PORT")
+app_psql_cmd=(psql -X -v ON_ERROR_STOP=1 -U "$APP_DB_USER" -h "$APP_DB_HOST" -p "$APP_DB_PORT")
 "${app_psql_cmd[@]}" -d postgres -c "SELECT 1;" >/dev/null
 
 echo "Applying main schema..."

@@ -1,62 +1,60 @@
-# core/utils.py
+"""Geometry helpers for pose analysis.
 
-import numpy as np
+Invalid or coincident landmarks must not look like valid zero-degree joints.
+Callers can catch ValueError and reject the observation instead of counting it.
+"""
+
+from math import atan2, degrees, hypot, isfinite
+
+
+def _point_xy(point):
+    try:
+        if len(point) != 2:
+            raise ValueError("Expected a two-dimensional point")
+        result = (float(point[0]), float(point[1]))
+    except (TypeError, IndexError, OverflowError) as exc:
+        raise ValueError("Expected a two-dimensional numeric point") from exc
+    if not all(isfinite(value) for value in result):
+        raise ValueError("Point coordinates must be finite")
+    return result
+
 
 def calculate_joint_angle(a, b, c):
-    """
-    Calculate the angle between three points for joint angles.
-    a, b, c: Each is a list or array with two elements [x, y].
-    """
-    try:
-        a = np.array(a)
-        b = np.array(b)
-        c = np.array(c)
-        radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
-        angle = np.abs(radians * 180.0 / np.pi)
-        if angle > 180:
-            angle = 360 - angle
-        return angle
-    except Exception as e:
-        print(f"Error calculating joint angle: {e}")
-        return 0
+    """Return the 0–180 degree angle at b, rejecting invalid/zero-length limbs."""
+    a, b, c = _point_xy(a), _point_xy(b), _point_xy(c)
+    first = (a[0] - b[0], a[1] - b[1])
+    second = (c[0] - b[0], c[1] - b[1])
+    first_length, second_length = hypot(*first), hypot(*second)
+    if (
+        not isfinite(first_length)
+        or not isfinite(second_length)
+        or first_length <= 1e-9
+        or second_length <= 1e-9
+    ):
+        raise ValueError("Joint angle requires two nonzero, finite limb vectors")
+    # atan2 avoids arccos rounding near a fully straight or contracted joint.
+    angle = degrees(atan2(second[1], second[0]) - atan2(first[1], first[0]))
+    return abs((angle + 180.0) % 360.0 - 180.0)
+
 
 def calculate_bend_angle(a, b):
-    """
-    Calculate the angle between the vector from b to a and the vertical axis.
-    Positive angle indicates back bend, negative indicates front bend.
-    """
-    try:
-        a = np.array(a)
-        b = np.array(b)
-        vector = a - b
-        vertical = np.array([0, -1])  # Assuming y-axis points down
+    """Return the signed angle from upright in image coordinates (y down)."""
+    a, b = _point_xy(a), _point_xy(b)
+    dx, dy = a[0] - b[0], a[1] - b[1]
+    length = hypot(dx, dy)
+    if not isfinite(length) or length <= 1e-9:
+        raise ValueError("Bend angle requires distinct, finite shoulder and hip points")
+    return degrees(atan2(-dx, -dy))
 
-        # Normalize vectors
-        if np.linalg.norm(vector) == 0:
-            return 0
-        vector_norm = vector / np.linalg.norm(vector)
-        vertical_norm = vertical / np.linalg.norm(vertical)
-
-        # Calculate dot product and angle
-        dot_prod = np.dot(vector_norm, vertical_norm)
-        angle_rad = np.arccos(np.clip(dot_prod, -1.0, 1.0))
-        angle = np.degrees(angle_rad)
-
-        # Determine direction (front or back bend)
-        cross_prod = np.cross(vertical_norm, vector_norm)
-        if cross_prod > 0:
-            angle = -angle  # Front bend
-        return angle
-    except Exception as e:
-        print(f"Error calculating bend angle: {e}")
-        return 0
 
 def is_within_range(value, target, tolerance):
-    """
-    Check if a value is within a specified tolerance of a target.
-    """
+    """Check a finite value against a finite target and nonnegative tolerance."""
     try:
-        return target - tolerance <= value <= target + tolerance
-    except Exception as e:
-        print(f"Error in is_within_range: {e}")
+        value, target, tolerance = float(value), float(target), float(tolerance)
+        return (
+            all(isfinite(item) for item in (value, target, tolerance))
+            and tolerance >= 0.0
+            and target - tolerance <= value <= target + tolerance
+        )
+    except (TypeError, ValueError, OverflowError):
         return False

@@ -8,7 +8,7 @@ import numpy as np
 import os
 import time
 from datetime import datetime
-from math import hypot
+from math import hypot, isfinite
 
 from PySide6.QtCore import QThread, Signal
 
@@ -75,7 +75,7 @@ class ExerciseWorker(QThread):
             value = float(raw)
         except (TypeError, ValueError):
             return default
-        return max(minimum, value)
+        return max(minimum, value) if isfinite(value) else default
 
     @staticmethod
     def _read_bool_env(var_name, default=False):
@@ -96,7 +96,9 @@ class ExerciseWorker(QThread):
         raw_seconds = os.getenv(seconds_var_name)
         if raw_seconds is not None:
             try:
-                return max(minimum, float(raw_seconds))
+                seconds = float(raw_seconds)
+                if isfinite(seconds):
+                    return max(minimum, seconds)
             except (TypeError, ValueError):
                 pass
 
@@ -107,7 +109,7 @@ class ExerciseWorker(QThread):
                     legacy_frames = float(raw_frames)
                 except (TypeError, ValueError):
                     legacy_frames = None
-                if legacy_frames is not None:
+                if legacy_frames is not None and isfinite(legacy_frames):
                     return max(minimum, legacy_frames / self._timing_reference_fps)
 
         if default_seconds is not None:
@@ -137,9 +139,8 @@ class ExerciseWorker(QThread):
         self.exercise_analysis_active = False
         self.exercise_analyzer = None
         self.current_user_info = None
-        self.exit_save_retry_limit = max(
-            0,
-            int(os.getenv("SMART_MIRROR_EXIT_SAVE_RETRY_LIMIT", "2")),
+        self.exit_save_retry_limit = self._read_int_env(
+            "SMART_MIRROR_EXIT_SAVE_RETRY_LIMIT", default=2, minimum=0,
         )
         self._exit_save_retry_count = 0
 
@@ -303,13 +304,23 @@ class ExerciseWorker(QThread):
         )
         self.tracked_user_hold_seconds = self._read_float_env(
             "SMART_MIRROR_TRACKED_USER_HOLD_SECONDS",
-            default=2.0,
+            default=5.0,
             minimum=0.5,
         )
         self.tracked_user_missing_timeout_seconds = self._read_float_env(
             "SMART_MIRROR_TRACKED_USER_MISSING_TIMEOUT_SECONDS",
-            default=max(6.0, self.tracked_user_hold_seconds * 3.0),
+            default=max(30.0, self.tracked_user_hold_seconds * 6.0),
             minimum=self.tracked_user_hold_seconds,
+        )
+        self.tracked_user_missing_warning_seconds = self._read_float_env(
+            "SMART_MIRROR_TRACKED_USER_MISSING_WARNING_SECONDS",
+            default=5.0,
+            minimum=0.5,
+        )
+        self.tracked_user_stale_countdown_seconds = self._read_float_env(
+            "SMART_MIRROR_TRACKED_USER_STALE_COUNTDOWN_SECONDS",
+            default=15.0,
+            minimum=self.tracked_user_missing_warning_seconds,
         )
         self.target_exit_confirm_seconds = self._read_float_env(
             "SMART_MIRROR_TARGET_EXIT_CONFIRM_SECONDS",
@@ -341,6 +352,33 @@ class ExerciseWorker(QThread):
             "SMART_MIRROR_TARGET_LOCK_MAX_SCALE_DRIFT",
             default=1.6,
             minimum=1.05,
+        )
+        self.target_lock_min_profile_score = self._read_float_env(
+            "SMART_MIRROR_TARGET_LOCK_MIN_PROFILE_SCORE",
+            default=0.42,
+            minimum=0.0,
+        )
+        self.target_lock_min_appearance_similarity = self._read_float_env(
+            "SMART_MIRROR_TARGET_LOCK_MIN_APPEARANCE_SIMILARITY",
+            default=0.24,
+            minimum=0.0,
+        )
+        self.target_lock_appearance_update_alpha = min(
+            1.0,
+            self._read_float_env(
+                "SMART_MIRROR_TARGET_LOCK_APPEARANCE_UPDATE_ALPHA",
+                default=0.12,
+                minimum=0.01,
+            ),
+        )
+        self.end_session_palm_hold_seconds = self._read_float_env(
+            "SMART_MIRROR_END_SESSION_PALM_HOLD_SECONDS",
+            default=3.0,
+            minimum=0.5,
+        )
+        self.end_session_palm_enabled = self._read_bool_env(
+            "SMART_MIRROR_END_SESSION_PALM_ENABLED",
+            default=True,
         )
         self.full_frame_pose_acquire = self._read_bool_env(
             "SMART_MIRROR_FULL_FRAME_POSE_ACQUIRE",
@@ -395,6 +433,8 @@ class ExerciseWorker(QThread):
         self.last_identity_confirmed_ts = 0.0
         self._target_face_recheck_elapsed_sec = 0.0
         self._pose_lock_established = False
+        self.session_identity_profile = None
+        self._end_session_palm_started_since = None
 
     def request_stop(self):
         self.stop_requested = True
@@ -463,6 +503,8 @@ class ExerciseWorker(QThread):
         self.last_identity_confirmed_ts = 0.0
         self._target_face_recheck_elapsed_sec = 0.0
         self._pose_lock_established = False
+        self.session_identity_profile = None
+        self._end_session_palm_started_since = None
 
     def _face_location_scale(self):
         inference_config = getattr(self.face_recognizer, "_inference_config", {}) or {}
@@ -678,7 +720,231 @@ class ExerciseWorker(QThread):
             frame_shape,
         )
 
-    def _seed_tracked_user_lock(self, username, face_location, frame_shape, now):
+    def _body_appearance_box(self, body_box, frame_shape):
+        if not body_box or frame_shape is None:
+            return None
+        frame_h, frame_w = frame_shape[:2]
+        left, top, right, bottom = body_box
+        body_w = max(1.0, float(right - left))
+        body_h = max(1.0, float(bottom - top))
+        crop_left = float(left) + (body_w * 0.14)
+        crop_right = float(right) - (body_w * 0.14)
+        crop_top = float(top) + (body_h * 0.20)
+        crop_bottom = float(top) + (body_h * 0.66)
+        if crop_right <= crop_left + 4 or crop_bottom <= crop_top + 4:
+            crop_left, crop_top, crop_right, crop_bottom = left, top, right, bottom
+        return self._normalize_pixel_box(
+            crop_left,
+            crop_top,
+            crop_right,
+            crop_bottom,
+            (frame_h, frame_w),
+        )
+
+    def _extract_appearance_histogram(self, frame, body_box):
+        if frame is None or body_box is None or getattr(frame, "size", 0) == 0:
+            return None
+        crop_box = self._body_appearance_box(body_box, frame.shape)
+        crop = self._crop_frame_to_roi(frame, crop_box)
+        if crop is None or getattr(crop, "size", 0) == 0:
+            return None
+        if crop.shape[0] < 8 or crop.shape[1] < 8:
+            return None
+        try:
+            hsv_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            hist = cv2.calcHist(
+                [hsv_crop],
+                [0, 1],
+                None,
+                [24, 16],
+                [0, 180, 0, 256],
+            ).astype(np.float32)
+            total = float(hist.sum())
+            if total <= 1e-6:
+                return None
+            return (hist / total).reshape(-1)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _appearance_similarity(reference_hist, candidate_hist):
+        if reference_hist is None or candidate_hist is None:
+            return None
+        reference = np.asarray(reference_hist, dtype=np.float32).reshape(-1)
+        candidate = np.asarray(candidate_hist, dtype=np.float32).reshape(-1)
+        if reference.shape != candidate.shape or reference.size == 0:
+            return None
+        try:
+            correlation = float(cv2.compareHist(reference, candidate, cv2.HISTCMP_CORREL))
+        except Exception:
+            return None
+        return max(0.0, min(1.0, correlation))
+
+    def _ensure_session_identity_profile(self):
+        username = (str(self.locked_username or "").strip() or None)
+        if not username:
+            return None
+        if (
+            not isinstance(self.session_identity_profile, dict)
+            or self.session_identity_profile.get("username") != username
+        ):
+            self.session_identity_profile = {
+                "username": username,
+                "appearance_hist": None,
+                "appearance_samples": 0,
+                "body_aspect": None,
+                "body_area_ratio": None,
+                "last_body_box": None,
+                "last_face_box": None,
+                "last_profile_update_ts": 0.0,
+                "last_match_score": None,
+                "last_appearance_similarity": None,
+            }
+        return self.session_identity_profile
+
+    def _body_profile_metrics(self, body_box, frame_shape):
+        if not body_box or frame_shape is None:
+            return None
+        frame_h, frame_w = frame_shape[:2]
+        left, top, right, bottom = body_box
+        width = max(1.0, float(right - left))
+        height = max(1.0, float(bottom - top))
+        frame_area = max(1.0, float(frame_w) * float(frame_h))
+        return {
+            "body_aspect": height / width,
+            "body_area_ratio": (width * height) / frame_area,
+        }
+
+    def _update_session_identity_profile(
+        self,
+        frame=None,
+        body_box=None,
+        face_box=None,
+        now=0.0,
+        strong_identity=False,
+    ):
+        profile = self._ensure_session_identity_profile()
+        if profile is None:
+            return None
+
+        body_box = body_box or self.locked_body_box
+        face_box = face_box or self.locked_face_box
+        if body_box is not None:
+            profile["last_body_box"] = body_box
+            metrics = self._body_profile_metrics(
+                body_box,
+                frame.shape if frame is not None else None,
+            )
+            if metrics:
+                for key in ("body_aspect", "body_area_ratio"):
+                    existing = profile.get(key)
+                    value = metrics[key]
+                    if existing is None or strong_identity:
+                        profile[key] = float(value)
+                    else:
+                        profile[key] = (0.90 * float(existing)) + (0.10 * float(value))
+        if face_box is not None:
+            profile["last_face_box"] = face_box
+
+        appearance_hist = self._extract_appearance_histogram(frame, body_box)
+        if appearance_hist is not None:
+            existing_hist = profile.get("appearance_hist")
+            if existing_hist is None:
+                profile["appearance_hist"] = appearance_hist
+            else:
+                alpha = 0.35 if strong_identity else self.target_lock_appearance_update_alpha
+                blended = ((1.0 - alpha) * np.asarray(existing_hist, dtype=np.float32)) + (
+                    alpha * appearance_hist
+                )
+                total = float(blended.sum())
+                profile["appearance_hist"] = blended / total if total > 1e-6 else appearance_hist
+            profile["appearance_samples"] = int(profile.get("appearance_samples") or 0) + 1
+
+        if now:
+            profile["last_profile_update_ts"] = float(now)
+        return profile
+
+    def _score_pose_against_session_profile(self, frame, pose_lock):
+        profile = self._ensure_session_identity_profile()
+        if profile is None or not pose_lock:
+            return {"matches": True, "score": 1.0, "appearance_similarity": None}
+
+        center = pose_lock.get("center")
+        size = pose_lock.get("size")
+        candidate_box = pose_lock.get("box")
+        candidate_w, candidate_h = size if size else (0.0, 0.0)
+        current_w, current_h = self.locked_body_size or (candidate_w, candidate_h)
+        current_center = self.locked_body_center or center
+
+        position_score = 1.0
+        if center and current_center:
+            center_reference = max(48.0, float(current_w), float(current_h))
+            distance = hypot(
+                float(center[0]) - float(current_center[0]),
+                float(center[1]) - float(current_center[1]),
+            )
+            position_score = 1.0 - min(1.0, distance / max(center_reference, 1.0))
+
+        scale_score = 1.0
+        if candidate_w > 0 and candidate_h > 0 and current_w > 0 and current_h > 0:
+            scale_ratio = max(
+                float(candidate_w) / max(float(current_w), 1.0),
+                float(current_w) / max(float(candidate_w), 1.0),
+                float(candidate_h) / max(float(current_h), 1.0),
+                float(current_h) / max(float(candidate_h), 1.0),
+            )
+            scale_score = 1.0 / max(1.0, scale_ratio)
+
+        aspect_score = 0.5
+        profile_aspect = profile.get("body_aspect")
+        if profile_aspect and candidate_w > 0 and candidate_h > 0:
+            candidate_aspect = float(candidate_h) / max(float(candidate_w), 1.0)
+            aspect_delta = abs(np.log(max(candidate_aspect, 1e-6) / max(float(profile_aspect), 1e-6)))
+            aspect_score = 1.0 - min(1.0, aspect_delta / max(np.log(2.2), 1e-6))
+
+        candidate_hist = self._extract_appearance_histogram(frame, candidate_box)
+        appearance_similarity = self._appearance_similarity(
+            profile.get("appearance_hist"),
+            candidate_hist,
+        )
+        appearance_score = 0.5 if appearance_similarity is None else appearance_similarity
+
+        score = (
+            (0.34 * position_score)
+            + (0.20 * scale_score)
+            + (0.16 * aspect_score)
+            + (0.30 * appearance_score)
+        )
+        appearance_samples = int(profile.get("appearance_samples") or 0)
+        relaxed_initial = not self._pose_lock_established
+        min_profile_score = self.target_lock_min_profile_score
+        min_appearance = self.target_lock_min_appearance_similarity
+        if relaxed_initial:
+            min_profile_score *= 0.72
+            min_appearance *= 0.60
+
+        matches = True
+        if (
+            appearance_samples > 0
+            and appearance_similarity is not None
+            and (self._pose_lock_established or appearance_samples >= 2)
+        ):
+            matches = appearance_similarity >= min_appearance
+        if matches and appearance_samples > 0:
+            matches = score >= min_profile_score
+
+        profile["last_match_score"] = float(score)
+        profile["last_appearance_similarity"] = appearance_similarity
+        return {
+            "matches": bool(matches),
+            "score": float(score),
+            "appearance_similarity": appearance_similarity,
+            "position_score": float(position_score),
+            "scale_score": float(scale_score),
+            "aspect_score": float(aspect_score),
+        }
+
+    def _seed_tracked_user_lock(self, username, face_location, frame_shape, now, frame=None):
         self.locked_username = (str(username or "").strip() or None)
         self.locked_face_box = self._face_location_to_pixels(face_location, frame_shape)
         body_center, body_size = self._estimate_body_lock_from_face_box(
@@ -692,6 +958,14 @@ class ExerciseWorker(QThread):
         self.target_exit_started_since = None
         self.last_identity_confirmed_ts = float(now or 0.0)
         self._target_face_recheck_elapsed_sec = 0.0
+        self.session_identity_profile = None
+        self._update_session_identity_profile(
+            frame=frame,
+            body_box=self.locked_body_box,
+            face_box=self.locked_face_box,
+            now=now,
+            strong_identity=True,
+        )
 
     def _build_target_lock_roi(self, frame_shape):
         frame_h, frame_w = frame_shape[:2]
@@ -746,14 +1020,21 @@ class ExerciseWorker(QThread):
         roi_h = max(1, bottom - top)
         frame_h, frame_w = frame_shape[:2]
         for landmark in pose_landmarks.landmark:
-            landmark.x = min(
-                1.0,
-                max(0.0, (float(left) + (float(landmark.x) * roi_w)) / float(frame_w)),
-            )
-            landmark.y = min(
-                1.0,
-                max(0.0, (float(top) + (float(landmark.y) * roi_h)) / float(frame_h)),
-            )
+            x, y = float(landmark.x), float(landmark.y)
+            z = float(getattr(landmark, "z", 0.0))
+            visibility = float(getattr(landmark, "visibility", 0.0))
+            if not all(isfinite(value) for value in (x, y, z, visibility)) or not 0 <= visibility <= 1:
+                # min/max would turn NaN into an apparently valid border point.
+                landmark.visibility = 0.0
+                continue
+            landmark.x = (float(left) + (x * roi_w)) / float(frame_w)
+            landmark.y = (float(top) + (y * roi_h)) / float(frame_h)
+            # MediaPipe z uses the same scale as x, relative to the input width.
+            # Keep depth gates consistent when pose inference switches to a crop.
+            landmark.z = z * float(roi_w) / float(frame_w)
+            if not (0.0 <= landmark.x <= 1.0 and 0.0 <= landmark.y <= 1.0):
+                # Preserve the geometry instead of clamping a limb into view.
+                landmark.visibility = 0.0
 
     def _landmark_bounds(self, landmarks, frame_shape):
         if not landmarks:
@@ -889,7 +1170,7 @@ class ExerciseWorker(QThread):
 
         return True
 
-    def _accept_pose_for_target_lock(self, landmarks, frame_shape):
+    def _accept_pose_for_target_lock(self, landmarks, frame_shape, frame=None):
         pose_lock = self._resolve_pose_lock(landmarks, frame_shape)
         if not pose_lock:
             return False
@@ -900,6 +1181,16 @@ class ExerciseWorker(QThread):
             candidate_face_box=pose_lock.get("face_box"),
         ):
             return False
+        profile_score = self._score_pose_against_session_profile(frame, pose_lock)
+        if not profile_score.get("matches", True):
+            logging.debug(
+                "Rejected pose candidate for %s by session profile score: %.3f "
+                "(appearance=%s).",
+                self.locked_username,
+                profile_score.get("score", 0.0),
+                profile_score.get("appearance_similarity"),
+            )
+            return False
         self.locked_body_box = pose_lock["box"]
         self.locked_body_center = pose_lock["center"]
         self.locked_body_size = pose_lock["size"]
@@ -908,6 +1199,12 @@ class ExerciseWorker(QThread):
         self.target_lost_since = None
         self.target_exit_started_since = None
         self._pose_lock_established = True
+        self._update_session_identity_profile(
+            frame=frame,
+            body_box=self.locked_body_box,
+            face_box=self.locked_face_box,
+            now=time.monotonic(),
+        )
         return True
 
     def _mark_target_visible(self):
@@ -957,6 +1254,116 @@ class ExerciseWorker(QThread):
 
     def _should_return_to_face_recognition(self, now, frame_shape=None):
         return self._has_target_exited_view(now, frame_shape)
+
+    def _tracked_user_missing_status_hint(self, tracked_name, now):
+        name = tracked_name or self.locked_username or self.assigned_user_name or "Athlete"
+        lost_elapsed = self._tracked_user_lost_elapsed(now)
+        timeout = max(
+            self.tracked_user_missing_timeout_seconds,
+            self.tracked_user_stale_countdown_seconds,
+        )
+        if lost_elapsed >= self.tracked_user_stale_countdown_seconds:
+            remaining = max(0, int(round(timeout - lost_elapsed)))
+            return f"{name} not visible. Session ending in {remaining}s."
+        if lost_elapsed >= self.tracked_user_missing_warning_seconds:
+            return f"{name} not visible. Step back in to resume or hold palm when visible to end."
+        return f"Waiting for {name}."
+
+    def _lock_marker_anchor(self, frame_shape):
+        anchor_box = self.locked_face_box or self.locked_body_box
+        if not anchor_box or frame_shape is None:
+            return None
+        frame_h, frame_w = frame_shape[:2]
+        left, top, right, bottom = anchor_box
+        anchor_x = int(round((float(left) + float(right)) / 2.0))
+        anchor_y = int(round(float(top)))
+        marker_y = max(18, anchor_y - max(18, int(round(float(bottom - top) * 0.28))))
+        return (
+            max(0, min(frame_w - 1, anchor_x)),
+            max(0, min(frame_h - 1, marker_y)),
+        )
+
+    def _draw_tracked_user_lock_marker(self, frame, now, paused=False):
+        if frame is None or getattr(frame, "size", 0) == 0 or not self.locked_username:
+            return False
+        anchor = self._lock_marker_anchor(frame.shape)
+        if anchor is None:
+            return False
+
+        lost_elapsed = self._tracked_user_lost_elapsed(now)
+        is_waiting = paused or self.target_lost_since is not None
+        marker_color = (80, 220, 255) if is_waiting else (118, 242, 130)
+        outline_color = (9, 18, 28)
+        text = (
+            f"WAITING {self.locked_username}"
+            if is_waiting and lost_elapsed >= self.tracked_user_missing_warning_seconds
+            else f"LOCKED {self.locked_username}"
+        )
+
+        x, y = anchor
+        pointer = np.array(
+            [
+                [x, y + 12],
+                [x - 12, y - 8],
+                [x + 12, y - 8],
+            ],
+            dtype=np.int32,
+        )
+        cv2.fillConvexPoly(frame, pointer, outline_color, cv2.LINE_AA)
+        inner_pointer = np.array(
+            [
+                [x, y + 8],
+                [x - 8, y - 6],
+                [x + 8, y - 6],
+            ],
+            dtype=np.int32,
+        )
+        cv2.fillConvexPoly(frame, inner_pointer, marker_color, cv2.LINE_AA)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = max(0.52, min(frame.shape[:2]) / 1350.0)
+        thickness = max(1, int(round(min(frame.shape[:2]) / 720.0)))
+        text_size, _baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        text_w, text_h = text_size
+        pad_x = 9
+        pad_y = 7
+        label_left = max(
+            4,
+            min(
+                frame.shape[1] - text_w - (pad_x * 2) - 4,
+                x - (text_w // 2) - pad_x,
+            ),
+        )
+        label_top = max(4, y - text_h - 32)
+        label_right = label_left + text_w + (pad_x * 2)
+        label_bottom = label_top + text_h + (pad_y * 2)
+        cv2.rectangle(
+            frame,
+            (label_left, label_top),
+            (label_right, label_bottom),
+            outline_color,
+            -1,
+            cv2.LINE_AA,
+        )
+        cv2.rectangle(
+            frame,
+            (label_left, label_top),
+            (label_right, label_bottom),
+            marker_color,
+            max(1, thickness),
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            text,
+            (label_left + pad_x, label_bottom - pad_y - 1),
+            font,
+            font_scale,
+            (236, 244, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+        return True
 
     def _should_run_target_face_recheck(self, now, force=False):
         if not self.locked_username or self.face_recognizer is None:
@@ -1028,6 +1435,13 @@ class ExerciseWorker(QThread):
                 self.display_user_name = self.locked_username
                 self.last_identity_confirmed_ts = float(now)
                 self._mark_target_visible()
+                self._update_session_identity_profile(
+                    frame=frame,
+                    body_box=self.locked_body_box,
+                    face_box=self.locked_face_box,
+                    now=now,
+                    strong_identity=True,
+                )
                 return {
                     "status": "confirmed",
                     "label": self.locked_username,
@@ -1132,8 +1546,16 @@ class ExerciseWorker(QThread):
             left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP.value]
             right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value]
 
-            left_shoulder_visible = getattr(left_shoulder, "visibility", 0.0) >= pose_visibility_threshold
-            right_shoulder_visible = getattr(right_shoulder, "visibility", 0.0) >= pose_visibility_threshold
+            def visible(point, threshold):
+                confidence = float(getattr(point, "visibility", 0.0))
+                return (
+                    isfinite(confidence)
+                    and threshold <= confidence <= 1.0
+                    and all(isfinite(float(getattr(point, axis, 0.0))) for axis in ("x", "y", "z"))
+                )
+
+            left_shoulder_visible = visible(left_shoulder, pose_visibility_threshold)
+            right_shoulder_visible = visible(right_shoulder, pose_visibility_threshold)
             if not (left_shoulder_visible and right_shoulder_visible):
                 return False
 
@@ -1141,15 +1563,15 @@ class ExerciseWorker(QThread):
                 0.18,
                 max(0.2, self.pose_visibility_threshold - 0.15) * threshold_factor,
             )
-            left_elbow_visible = getattr(left_elbow, "visibility", 0.0) >= arm_visibility_threshold
-            right_elbow_visible = getattr(right_elbow, "visibility", 0.0) >= arm_visibility_threshold
+            left_elbow_visible = visible(left_elbow, arm_visibility_threshold)
+            right_elbow_visible = visible(right_elbow, arm_visibility_threshold)
             if self.exercise_choice == "deadlift":
                 leg_visibility_threshold = max(
                     0.18,
                     max(0.2, self.pose_visibility_threshold - 0.15) * threshold_factor,
                 )
-                left_knee_visible = getattr(left_knee, "visibility", 0.0) >= leg_visibility_threshold
-                right_knee_visible = getattr(right_knee, "visibility", 0.0) >= leg_visibility_threshold
+                left_knee_visible = visible(left_knee, leg_visibility_threshold)
+                right_knee_visible = visible(right_knee, leg_visibility_threshold)
                 if not (left_knee_visible or right_knee_visible):
                     return False
             elif not (left_elbow_visible or right_elbow_visible):
@@ -1163,8 +1585,8 @@ class ExerciseWorker(QThread):
             if shoulder_width < max(shoulder_width_floor, self.min_pose_shoulder_width * threshold_factor):
                 return False
 
-            left_hip_visible = getattr(left_hip, "visibility", 0.0) >= pose_visibility_threshold
-            right_hip_visible = getattr(right_hip, "visibility", 0.0) >= pose_visibility_threshold
+            left_hip_visible = visible(left_hip, pose_visibility_threshold)
+            right_hip_visible = visible(right_hip, pose_visibility_threshold)
             if left_hip_visible and right_hip_visible:
                 shoulder_mid_y = (float(left_shoulder.y) + float(right_shoulder.y)) / 2.0
                 hip_mid_y = (float(left_hip.y) + float(right_hip.y)) / 2.0
@@ -1176,6 +1598,88 @@ class ExerciseWorker(QThread):
             return True
         except Exception:
             return False
+
+    @staticmethod
+    def _pose_landmark_xy(landmarks, pose_landmark):
+        point = landmarks[pose_landmark.value]
+        return float(point.x), float(point.y)
+
+    def _hand_open_palm_like(self, landmarks, side):
+        if not landmarks:
+            return False
+        try:
+            if side == "left":
+                shoulder_lmk = mp_pose.PoseLandmark.LEFT_SHOULDER
+                wrist_lmk = mp_pose.PoseLandmark.LEFT_WRIST
+                index_lmk = mp_pose.PoseLandmark.LEFT_INDEX
+                pinky_lmk = mp_pose.PoseLandmark.LEFT_PINKY
+                thumb_lmk = mp_pose.PoseLandmark.LEFT_THUMB
+            else:
+                shoulder_lmk = mp_pose.PoseLandmark.RIGHT_SHOULDER
+                wrist_lmk = mp_pose.PoseLandmark.RIGHT_WRIST
+                index_lmk = mp_pose.PoseLandmark.RIGHT_INDEX
+                pinky_lmk = mp_pose.PoseLandmark.RIGHT_PINKY
+                thumb_lmk = mp_pose.PoseLandmark.RIGHT_THUMB
+
+            visibility_floor = max(0.30, self.pose_visibility_threshold - 0.10)
+            required = [wrist_lmk, index_lmk, pinky_lmk, thumb_lmk]
+            if any(
+                getattr(landmarks[landmark.value], "visibility", 0.0) < visibility_floor
+                for landmark in required
+            ):
+                return False
+
+            wrist = self._pose_landmark_xy(landmarks, wrist_lmk)
+            index = self._pose_landmark_xy(landmarks, index_lmk)
+            pinky = self._pose_landmark_xy(landmarks, pinky_lmk)
+            thumb = self._pose_landmark_xy(landmarks, thumb_lmk)
+            shoulder = self._pose_landmark_xy(landmarks, shoulder_lmk)
+            left_shoulder = self._pose_landmark_xy(landmarks, mp_pose.PoseLandmark.LEFT_SHOULDER)
+            right_shoulder = self._pose_landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_SHOULDER)
+
+            shoulder_width = hypot(
+                left_shoulder[0] - right_shoulder[0],
+                left_shoulder[1] - right_shoulder[1],
+            )
+            hand_spread = hypot(index[0] - pinky[0], index[1] - pinky[1])
+            hand_reach = max(
+                hypot(index[0] - wrist[0], index[1] - wrist[1]),
+                hypot(pinky[0] - wrist[0], pinky[1] - wrist[1]),
+                hypot(thumb[0] - wrist[0], thumb[1] - wrist[1]),
+            )
+            hand_is_open = (
+                hand_spread >= max(0.018, shoulder_width * 0.12)
+                and hand_reach >= max(0.028, shoulder_width * 0.16)
+            )
+            hand_is_raised = wrist[1] <= (shoulder[1] + 0.05)
+            return bool(hand_is_open and hand_is_raised)
+        except Exception:
+            return False
+
+    def _detect_end_session_palm_gesture(self, landmarks):
+        if not self.end_session_palm_enabled:
+            return False
+        return self._hand_open_palm_like(landmarks, "left") or self._hand_open_palm_like(
+            landmarks,
+            "right",
+        )
+
+    def _reset_end_session_palm_hold(self):
+        self._end_session_palm_started_since = None
+
+    def _update_end_session_palm_hold(self, landmarks, now):
+        if not self._detect_end_session_palm_gesture(landmarks):
+            self._reset_end_session_palm_hold()
+            return False, None
+
+        if self._end_session_palm_started_since is None:
+            self._end_session_palm_started_since = float(now)
+        elapsed = max(0.0, float(now) - float(self._end_session_palm_started_since))
+        hint = (
+            f"Hold palm to end: {min(elapsed, self.end_session_palm_hold_seconds):.1f}s / "
+            f"{self.end_session_palm_hold_seconds:.1f}s"
+        )
+        return elapsed >= self.end_session_palm_hold_seconds, hint
 
     def _emit_audio_message(self, text, force=False):
         text = (text or "").strip()
@@ -1946,6 +2450,7 @@ class ExerciseWorker(QThread):
                                 pose_matches_target = self._accept_pose_for_target_lock(
                                     results.pose_landmarks.landmark,
                                     frame_bgr.shape,
+                                    frame=frame_bgr,
                                 )
                                 if not pose_matches_target:
                                     reliable_pose = False
@@ -1986,10 +2491,28 @@ class ExerciseWorker(QThread):
                                 self._last_reliable_pose_ts = now
                                 self._mark_target_visible()
                                 landmarks = results.pose_landmarks.landmark
+                                end_session_requested, end_session_hint = self._update_end_session_palm_hold(
+                                    landmarks,
+                                    now,
+                                )
+                                if end_session_requested:
+                                    self._finalize_tracked_user_exit(
+                                        now,
+                                        exit_reason=f"{tracked_name} ended the session",
+                                    )
+                                    analysis_overlay_data = None
+                                    analysis_feedback_texts = []
+                                    recognition_overlay_data = None
+                                    self._target_face_recheck_elapsed_sec = 0.0
+                                    self._sleep_to_target_loop(loop_started_at)
+                                    continue
+
                                 feedback_texts, overlay_metrics = self.exercise_analyzer.analyze_exercise_form(
                                     landmarks,
                                     frame_bgr,
                                 )
+                                if end_session_hint:
+                                    feedback_texts = [end_session_hint] + list(feedback_texts)
 
                                 if not self.exercise_analyzer.stable_start_detected:
                                     connection_color = (255, 140, 90)
@@ -2010,6 +2533,7 @@ class ExerciseWorker(QThread):
 
                                 if self._visual_output_due(now):
                                     self._draw_cached_pose_overlay_if_recent(frame_bgr, now)
+                                    self._draw_tracked_user_lock_marker(frame_bgr, now, paused=False)
 
                                 self._emit_important_audio(feedback_texts, overlay_metrics)
                                 analysis_overlay_data = self._build_overlay_data(
@@ -2032,6 +2556,8 @@ class ExerciseWorker(QThread):
                                     now,
                                 )
                             else:
+                                self.exercise_analyzer.invalidate_tracking()
+                                self._reset_end_session_palm_hold()
                                 self.exercise_analyzer.update_current_weight(frame_bgr)
                                 if face_confirmed and not other_person_detected:
                                     self.exercise_analyzer.no_pose_frames = 0
@@ -2052,9 +2578,9 @@ class ExerciseWorker(QThread):
                                     else:
                                         self.exercise_analyzer.no_pose_frames = 0
                                     self._mark_target_missing(now, frame_bgr.shape)
-                                    status_hint = (
-                                        f"{face_recheck_result.get('label') or 'Another person'} is in front. "
-                                        f"Waiting for {tracked_name}."
+                                    status_hint = self._tracked_user_missing_status_hint(
+                                        tracked_name,
+                                        now,
                                     )
                                 elif grace_active:
                                     self._analysis_pose_grace_remaining_sec = max(
@@ -2074,8 +2600,9 @@ class ExerciseWorker(QThread):
                                     else:
                                         self.exercise_analyzer.no_pose_frames = 0
                                         self._mark_target_missing(now, frame_bgr.shape)
-                                        status_hint = (
-                                            f"Waiting for {tracked_name} to step fully into frame."
+                                        status_hint = self._tracked_user_missing_status_hint(
+                                            tracked_name,
+                                            now,
                                         )
                                 else:
                                     if self._last_reliable_pose_ts <= 0.0:
@@ -2098,7 +2625,10 @@ class ExerciseWorker(QThread):
                                                 self.exercise_analyzer.no_pose_frames,
                                             )
                                             status_hint = (
-                                                f"Body landmarks unstable. Waiting for {tracked_name}."
+                                                self._tracked_user_missing_status_hint(
+                                                    tracked_name,
+                                                    now,
+                                                )
                                             )
                                         else:
                                             logging.debug(
@@ -2107,7 +2637,10 @@ class ExerciseWorker(QThread):
                                                 self.exercise_analyzer.no_pose_frames,
                                             )
                                             status_hint = (
-                                                f"Tracking paused. Waiting for {tracked_name} to step back in frame."
+                                                self._tracked_user_missing_status_hint(
+                                                    tracked_name,
+                                                    now,
+                                                )
                                             )
 
                                 analysis_overlay_data = self._build_overlay_data(
@@ -2122,6 +2655,7 @@ class ExerciseWorker(QThread):
                                 analysis_feedback_texts = []
                                 if self._visual_output_due(now):
                                     self._draw_cached_pose_overlay_if_recent(frame_bgr, now)
+                                    self._draw_tracked_user_lock_marker(frame_bgr, now, paused=True)
                                     self._emit_visual_outputs(
                                         frame_bgr,
                                         now,
@@ -2154,6 +2688,11 @@ class ExerciseWorker(QThread):
                                 status_hint="Tracking movement...",
                             )
                             self._draw_cached_pose_overlay_if_recent(frame_bgr, now)
+                            self._draw_tracked_user_lock_marker(
+                                frame_bgr,
+                                now,
+                                paused=self.target_lost_since is not None,
+                            )
                             self._emit_visual_outputs(
                                 frame_bgr,
                                 now,
@@ -2171,6 +2710,8 @@ class ExerciseWorker(QThread):
                         continue
 
                     except Exception as e:
+                        if self.exercise_analyzer:
+                            self.exercise_analyzer.invalidate_tracking()
                         self.status_signal.emit("Exercise analysis error.")
                         logging.error(f"Exercise analysis error: {e}")
                         self._sleep_to_target_loop(loop_started_at)
@@ -2310,6 +2851,7 @@ class ExerciseWorker(QThread):
                             if (
                                 primary_face_index is not None
                                 and stable_primary_label is not None
+                                and stable_primary_label == primary_raw_label
                                 and primary_face_index < len(display_face_names)
                             ):
                                 display_face_names[primary_face_index] = stable_primary_label
@@ -2318,8 +2860,8 @@ class ExerciseWorker(QThread):
                             self._draw_cached_face_boxes_if_recent(display_frame, now)
 
                             if primary_face_index is not None and primary_face_index < len(display_face_names):
-                                effective_label = display_face_names[primary_face_index]
-                                if effective_label == "Unknown":
+                                effective_label = primary_raw_label
+                                if not effective_label or effective_label == "Unknown":
                                     status_hint = "Unknown user detected. Hold still for registration."
                                     should_prompt_unknown = self.recognition_state.observe_unknown(
                                         recognition_elapsed_seconds,
@@ -2330,6 +2872,12 @@ class ExerciseWorker(QThread):
                                         )
                                         logging.info("Stable unknown user detected.")
                                         self.unknown_user_detected.emit()
+                                elif effective_label != stable_primary_label:
+                                    # Label smoothing is for presentation. Starting a
+                                    # session also requires current evidence for the
+                                    # identity whose face will seed the body lock.
+                                    self.recognition_state.clear_known_progress()
+                                    status_hint = "Verifying the person in front of the camera."
                                 else:
                                     recognized_user = effective_label
                                     self.display_user_name = recognized_user
@@ -2373,6 +2921,7 @@ class ExerciseWorker(QThread):
                                                     face_locations[primary_face_index],
                                                     frame.shape,
                                                     now,
+                                                    frame=frame,
                                                 )
                                             resume_set_offset = self._today_exercise_set_offset(user_info)
                                             self.exercise_analyzer = ExerciseAnalyzer(

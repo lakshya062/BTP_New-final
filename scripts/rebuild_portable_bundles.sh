@@ -18,8 +18,8 @@ Options:
   --arm64        Build only the Apple Silicon / ARM bundle
   --host-only    Build only the current machine architecture
   --all          Build both amd64 and arm64 bundles (default)
-  --start        Rebuild and then start backend + postgres for the host architecture
-  --start-mirror Rebuild and then start backend + postgres + mirror for the host architecture
+  --start        Rebuild and then start postgres for the host architecture
+  --start-mirror Rebuild and then start postgres + mirror for the host architecture
   -h, --help     Show this help text
 
 Examples:

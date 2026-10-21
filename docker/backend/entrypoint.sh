@@ -27,10 +27,10 @@ user = os.environ["GYM_DB_USER"]
 password = os.environ.get("GYM_DB_PASSWORD", "")
 timeout = int(os.environ.get("SMART_GYM_DB_WAIT_TIMEOUT", "60"))
 
-deadline = time.time() + max(timeout, 1)
+deadline = time.monotonic() + max(timeout, 1)
 last_error = "unknown database error"
 
-while time.time() < deadline:
+while time.monotonic() < deadline:
     try:
         connection = psycopg2.connect(
             dbname=name,
@@ -38,6 +38,7 @@ while time.time() < deadline:
             password=password,
             host=host,
             port=port,
+            connect_timeout=max(1, min(5, int(deadline - time.monotonic()))),
         )
         connection.close()
         print(f"PostgreSQL is ready at {host}:{port}.")
@@ -58,4 +59,9 @@ PY
 
 export SMART_GYM_SKIP_AUTO_MIGRATE=1
 python manage.py migrate --noinput
-exec python manage.py runserver 0.0.0.0:8000
+exec gunicorn backend.wsgi:application \
+    --bind 0.0.0.0:8000 \
+    --workers "${GYM_WEB_WORKERS:-2}" \
+    --timeout "${GYM_WEB_TIMEOUT:-60}" \
+    --access-logfile - \
+    --error-logfile -

@@ -1,9 +1,25 @@
 # Centralized Docker Bundle
 
 ## What this gives you
-- `postgres`: shared database server for the centralized runtime, with the gym databases created inside the image startup flow
-- `backend`: Django API server on port `8000`
-- `mirror`: centralized PySide display runtime in a Linux container
+- `postgres`: database server for the mirror runtime, with `gym_main_db` created during image startup
+- `mirror`: PySide smart mirror runtime in a Linux container
+
+This bundle intentionally excludes `Gym_App`, `gym_backend`, and the Django backend image. The mirror writes directly to PostgreSQL, and server sync is disabled in the Docker compose environment.
+
+The mirror's face data, configuration and logs persist in the
+`smart-gym-mirror-state` volume. PostgreSQL uses `smart-gym-postgres`. Back up both;
+`docker compose down -v` deletes their data.
+When upgrading an existing container without a state volume, back up its
+`/root/.local/share/smart-gym-client` directory before recreating it and restore
+those files into the new mirror state volume. PostgreSQL data remains in its
+existing named volume.
+
+The database port binds to `127.0.0.1` by default. Set `SMART_GYM_DB_BIND_HOST` and
+`SMART_GYM_DB_PORT` in the bundle `.env` only when a different host interface or
+port is required. Set `SMART_GYM_DB_PASSWORD` before initializing a new database
+volume; changing the `.env` password alone does not rotate an existing database
+role's password. For native installation and checks, see
+[runtime_setup.md](runtime_setup.md) in the source repository.
 
 ## Export from the Mac
 ```bash
@@ -81,24 +97,17 @@ What this gives you after every rebuild:
 ```
 
 ## Why the Docker requirements files are short
-- `docker/requirements/backend.txt` only lists Python packages that the Django backend needs at runtime.
 - `docker/requirements/mirror.txt` only lists Python packages that the mirror container needs at runtime.
 - Standard-library modules are not listed because Python already provides them.
 - System packages such as `cmake` are installed in the Dockerfiles, not in `requirements.txt`.
 - `dlib` and `face-recognition` are installed directly in `docker/mirror/Dockerfile` because they need a custom source build for cross-platform container compatibility.
 
-## Why `docker run smart-gym-backend...` failed
-- The backend container is not supposed to contain PostgreSQL inside the same image.
-- In the centralized stack, PostgreSQL is its own Docker image/container and the backend connects to it over the Docker network.
-- Running only the backend image makes it look for a database that is not there, which is why you saw `connection refused`.
-- In the command you pasted, you also ran `smart-gym-backend:portable-arm64`. On Windows/Linux x86_64 you should use the `amd64` bundle instead.
-
 ## If you want raw `docker run` instead of `docker compose`
-Start both containers on the same Docker network:
+Start PostgreSQL first, then run the mirror on the same Docker network when GUI and camera passthrough are available:
 ```bash
 docker network create smart-gym-centralized
 docker run -d --name smart-gym-postgres --network smart-gym-centralized -e POSTGRES_USER=smartgym -e POSTGRES_PASSWORD=smartgym smart-gym-postgres:portable-amd64
-docker run -it --rm -p 8000:8000 --network smart-gym-centralized -e GYM_DB_HOST=smart-gym-postgres smart-gym-backend:portable-amd64
+docker run -it --rm --privileged --network smart-gym-centralized -e DISPLAY -e SMART_MIRROR_DB_BACKEND=postgres -e SMART_MIRROR_PG_DB=gym_main_db -e SMART_MIRROR_PG_USER=smartgym -e SMART_MIRROR_PG_PASSWORD=smartgym -e SMART_MIRROR_PG_HOST=smart-gym-postgres -e SMART_GYM_SERVER_SYNC_ENABLED=0 -v /tmp/.X11-unix:/tmp/.X11-unix -v /dev:/dev smart-gym-mirror:portable-amd64
 ```
 
 ## Important host notes

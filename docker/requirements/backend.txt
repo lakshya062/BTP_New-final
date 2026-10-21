@@ -5,3 +5,4 @@ django-cors-headers==4.9.0
 djangorestframework==3.16.1
 psycopg2-binary==2.9.11
 bcrypt==5.0.0
+gunicorn==23.0.0; sys_platform != "win32"

@@ -3,14 +3,14 @@
 import sys
 import os
 import faulthandler
+import logging
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from PySide6.QtWidgets import QApplication, QMessageBox, QSplashScreen
 from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtCore import Qt
 from core.logging_config import configure_logging
 from core.paths import resource_path, state_path
-from ui.main_window import MainWindow
 
 _fault_log_file = None
 
@@ -21,11 +21,14 @@ def _configure_runtime_diagnostics():
         fault_log_path = state_path("logs", "mirror_fault.log")
         _fault_log_file = open(fault_log_path, "a", buffering=1)
         _fault_log_file.write(
-            f"\n=== Session {datetime.utcnow().isoformat()}Z pid={os.getpid()} ===\n"
+            f"\n=== Session {datetime.now(timezone.utc).isoformat()} pid={os.getpid()} ===\n"
         )
         faulthandler.enable(file=_fault_log_file, all_threads=True)
     except Exception:
+        if _fault_log_file is not None:
+            _fault_log_file.close()
         _fault_log_file = None
+        logging.warning("Could not enable the native crash log.", exc_info=True)
 
     # Keep runtime logs clean; this warning is non-fatal and very noisy.
     warnings.filterwarnings(
@@ -39,7 +42,7 @@ def main():
     try:
         configure_logging()
         _configure_runtime_diagnostics()
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+        os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '2')
         app = QApplication(sys.argv)
         app.setApplicationName("Smart Gym Client System")
         app.setOrganizationName("SmartGym")
@@ -60,7 +63,7 @@ def main():
 
         stylesheet_path = resource_path("styles.qss")
         if os.path.exists(stylesheet_path):
-            with open(stylesheet_path, "r") as f:
+            with open(stylesheet_path, "r", encoding="utf-8") as f:
                 app.setStyleSheet(f.read())
         else:
             # Enhanced basic styling if no QSS found
@@ -133,6 +136,10 @@ def main():
             }
             """)
 
+        # Import native AI libraries only after logging and crash diagnostics
+        # are configured, so import-time failures are captured as well.
+        from ui.main_window import MainWindow
+
         window = MainWindow()
         window.show()
 
@@ -142,7 +149,7 @@ def main():
         sys.exit(app.exec())
     
     except Exception as e:
-        print(f"An error occurred: {e}")
+        logging.exception("Application startup failed.")
         app = QApplication.instance()
         if app:
             QMessageBox.critical(None, "Error", f"An unexpected error occurred:\n{e}")

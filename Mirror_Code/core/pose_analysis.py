@@ -1,7 +1,9 @@
 # core/pose_analysis.py
 
 import logging
+from copy import copy
 from datetime import datetime
+from math import isfinite
 import os
 import time
 import uuid
@@ -14,6 +16,39 @@ from .utils import calculate_bend_angle, calculate_joint_angle
 
 mp_pose = mp.solutions.pose
 logger = logging.getLogger(__name__)
+
+
+def _positive_int_env(name, default):
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("Invalid %s; using %s.", name, default)
+        return default
+
+
+def _project_landmarks_for_geometry(landmarks, frame):
+    """Copy normalized landmarks into a common image-height unit for x/y.
+
+    MediaPipe normalizes x by width and y by height. Angles and body-distance
+    ratios need matching units. Depth and confidence stay in their native units;
+    the form gates' depth tolerances are calibrated to MediaPipe's raw z values.
+    The original normalized points remain available for overlays and tracking.
+    """
+    if frame is None:
+        return landmarks
+    try:
+        height, width = frame.shape[:2]
+        aspect_ratio = float(width) / float(height)
+        if not isfinite(aspect_ratio) or height <= 0 or width <= 0:
+            return []
+        projected = []
+        for point in landmarks:
+            metric_point = copy(point)
+            metric_point.x = float(point.x) * aspect_ratio
+            projected.append(metric_point)
+        return projected
+    except (AttributeError, TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return []
 
 
 class ExerciseAnalyzer:
@@ -33,15 +68,13 @@ class ExerciseAnalyzer:
         self.username_snapshot = username_snapshot
         try:
             self.starting_set_count = max(0, int(starting_set_count or 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             self.starting_set_count = 0
-        self.weight_detection_stride = max(
-            1,
-            int(os.getenv("SMART_MIRROR_ARUCO_DETECT_EVERY_N_FRAMES", "2")),
+        self.weight_detection_stride = _positive_int_env(
+            "SMART_MIRROR_ARUCO_DETECT_EVERY_N_FRAMES", 2,
         )
-        self.ready_feedback_hold_frames = max(
-            1,
-            int(os.getenv("SMART_MIRROR_READY_FEEDBACK_FRAMES", "8")),
+        self.ready_feedback_hold_frames = _positive_int_env(
+            "SMART_MIRROR_READY_FEEDBACK_FRAMES", 8,
         )
         self.reset_counters()
 
@@ -81,28 +114,52 @@ class ExerciseAnalyzer:
         self.exercise_start_time = None
         self.ready_feedback_frames_remaining = 0
 
+    def _reset_pending_rep(self):
+        """Discard an incomplete movement without losing completed activity."""
+        self.rep_state = 0
+        self.rep_start_angle = None
+        self.rep_end_angle = None
+        self.rep_started_ts = None
+        self.rep_started_at_utc = None
+        self.rep_active_arm = None
+        self.rep_down_wrist_to_shoulder_ratio = None
+        self.rep_left_down_zone = False
+        self.rep_left_up_zone = False
+
+    def invalidate_tracking(self):
+        """Require a new starting pose after tracking or identity is lost.
+
+        Completed reps and sets remain intact. The worker can call this when no
+        reliable pose is available so a later frame cannot finish a stale rep.
+        """
+        self._reset_pending_rep()
+        self.stable_frames = 0
+        self.side_pose_stable_frames = 0
+        self.active_curl_arm = None
+        self.active_body_side = None
+        self.ready_feedback_frames_remaining = 0
+
     def detect_bend(self, landmarks):
         try:
-            left_shoulder = [
-                landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x,
-                landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y,
-            ]
-            right_shoulder = [
-                landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
-                landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y,
-            ]
-            left_hip = [
-                landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x,
-                landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y,
-            ]
-            right_hip = [
-                landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
-                landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y,
-            ]
-
-            angle_left = calculate_bend_angle(left_shoulder, left_hip)
-            angle_right = calculate_bend_angle(right_shoulder, right_hip)
-            angle = (angle_left + angle_right) / 2
+            angles = []
+            for shoulder_id, hip_id in (
+                (mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.LEFT_HIP),
+                (mp_pose.PoseLandmark.RIGHT_SHOULDER, mp_pose.PoseLandmark.RIGHT_HIP),
+            ):
+                shoulder, hip = landmarks[shoulder_id.value], landmarks[hip_id.value]
+                confidence = (float(getattr(shoulder, "visibility", 0.0)),
+                              float(getattr(hip, "visibility", 0.0)))
+                if not all(0.35 <= value <= 1.0 for value in confidence):
+                    continue
+                try:
+                    angles.append(calculate_bend_angle(
+                        [shoulder.x, shoulder.y], [hip.x, hip.y],
+                    ))
+                except ValueError:
+                    continue
+            if not angles:
+                return True, "unreliable"
+            angle = sum(angles) / len(angles)
             tolerance = 3
             if angle > tolerance:
                 return True, "back"
@@ -110,8 +167,8 @@ class ExerciseAnalyzer:
                 return True, "front"
             return False, None
         except Exception as exc:
-            logger.error("Error in detect_bend: %s", exc)
-            return False, None
+            logger.debug("Unable to measure torso bend: %s", exc)
+            return True, "unreliable"
 
     def _log_weight_update(self):
         if self.current_marker_id is not None:
@@ -177,8 +234,12 @@ class ExerciseAnalyzer:
 
         cfg = exercise_config.get(self.exercise, {})
         rep_angle_keys = cfg.get("rep_angle_keys") or list(angle_values.keys())
-        rep_values = [angle_values[key] for key in rep_angle_keys if key in angle_values]
-        if not rep_values:
+        # A missing/occluded limb must not silently turn a bilateral movement
+        # into a unilateral one or contribute a fabricated zero-degree angle.
+        if any(key not in angle_values for key in rep_angle_keys):
+            return None
+        rep_values = [angle_values[key] for key in rep_angle_keys]
+        if not rep_values or not all(isfinite(value) for value in rep_values):
             return None
         return sum(rep_values) / len(rep_values)
 
@@ -217,6 +278,7 @@ class ExerciseAnalyzer:
             return feedback_texts, overlay_metrics
 
         cfg = exercise_config[self.exercise]
+        landmarks = _project_landmarks_for_geometry(landmarks, frame)
         down_min, down_max = cfg.get("down_range", (0.0, 0.0))
         up_min, up_max = cfg.get("up_range", (0.0, 0.0))
         count_range_margin = max(0.0, float(cfg.get("count_range_margin", 0.0)))
@@ -233,6 +295,8 @@ class ExerciseAnalyzer:
                     feedback_texts.append("Warning: Keep your back straight!")
                 elif bend_type == "front":
                     feedback_texts.append("Warning: Do not bend forward!")
+                elif bend_type == "unreliable":
+                    feedback_texts.append("Keep shoulders and hips visible so posture can be checked.")
                 self.bend_warning_displayed = True
             else:
                 self.bend_warning_displayed = False
@@ -245,13 +309,18 @@ class ExerciseAnalyzer:
         angle_values = {}
         for angle_name, points in cfg["angles"].items():
             try:
+                visibility = [
+                    float(getattr(landmarks[point.value], "visibility", 0.0))
+                    for point in points
+                ]
+                if not all(0.35 <= confidence <= 1.0 for confidence in visibility):
+                    continue
                 p1 = [landmarks[points[0].value].x, landmarks[points[0].value].y]
                 p2 = [landmarks[points[1].value].x, landmarks[points[1].value].y]
                 p3 = [landmarks[points[2].value].x, landmarks[points[2].value].y]
                 angle_values[angle_name] = calculate_joint_angle(p1, p2, p3)
             except Exception as exc:
-                logger.error("Error calculating angle for %s: %s", angle_name, exc)
-                angle_values[angle_name] = 0.0
+                logger.debug("Unable to measure angle for %s: %s", angle_name, exc)
 
         self.update_current_weight(frame)
         bicep_form = {
@@ -439,7 +508,22 @@ class ExerciseAnalyzer:
                 else self._resolve_rep_angle(angle_values)
             )
         )
+        if rep_angle is None or not isfinite(rep_angle):
+            rep_angle = None
+            self.invalidate_tracking()
+            feedback_texts.append("Tracking unclear. Keep the working joints visible.")
         if rep_angle is not None:
+            up_increases_angle = (up_min + up_max) > (down_min + down_max)
+            departed_down_range = (
+                rep_angle > (down_max + phase_leave_margin)
+                if up_increases_angle
+                else rep_angle < (down_min - phase_leave_margin)
+            )
+            departed_up_range = (
+                rep_angle < (up_min - phase_leave_margin)
+                if up_increases_angle
+                else rep_angle > (up_max + phase_leave_margin)
+            )
             startup_down_min, startup_down_max = down_min, down_max
             startup_count_down_min, startup_count_down_max = count_down_min, count_down_max
             stable_frames_required = 30
@@ -505,24 +589,23 @@ class ExerciseAnalyzer:
                         self.rep_left_down_zone = False
                         self.rep_left_up_zone = False
                         if self.exercise == "bicep_curl":
-                            self.rep_down_wrist_to_shoulder_ratio = bicep_form[
-                                "active_wrist_shoulder_ratio"
-                            ]
+                            self.rep_active_arm = bicep_form.get("startup_active_arm") or bicep_form.get("active_arm")
+                            self.rep_down_wrist_to_shoulder_ratio = bicep_form.get(
+                                "startup_wrist_shoulder_ratio",
+                                bicep_form.get("active_wrist_shoulder_ratio"),
+                            )
                         elif self.exercise == "deadlift":
-                            self.rep_active_arm = deadlift_form.get("active_side")
+                            self.rep_active_arm = deadlift_form.get("startup_active_side") or deadlift_form.get("active_side")
                 else:
-                    self.stable_frames = max(0, self.stable_frames - 1)
+                    self.stable_frames = 0
             else:
                 if self.exercise == "bicep_curl":
                     if not form_ready:
-                        self.rep_state = 0
-                        self.rep_start_angle = None
-                        self.rep_active_arm = None
-                        self.rep_down_wrist_to_shoulder_ratio = None
-                        self.rep_left_down_zone = False
-                        self.rep_left_up_zone = False
+                        self._reset_pending_rep()
                     else:
                         active_arm = bicep_form["active_arm"]
+                        if self.rep_active_arm is not None and active_arm != self.rep_active_arm:
+                            self._reset_pending_rep()
                         if self.rep_state == 0 and count_down_min <= rep_angle <= count_down_max:
                             self.rep_state = 1
                             self.rep_active_arm = active_arm
@@ -555,7 +638,7 @@ class ExerciseAnalyzer:
                             ):
                                 self.rep_state = 2
                                 self.rep_start_angle = rep_angle
-                                self.rep_started_ts = time.time()
+                                self.rep_started_ts = time.monotonic()
                                 self.rep_started_at_utc = datetime.utcnow().isoformat()
                                 self.rep_active_arm = active_arm
                                 self.rep_left_down_zone = False
@@ -577,7 +660,7 @@ class ExerciseAnalyzer:
                                 rep_ended_at_utc = datetime.utcnow().isoformat()
                                 duration_seconds = None
                                 if self.rep_started_ts is not None:
-                                    duration_seconds = max(0.0, time.time() - self.rep_started_ts)
+                                    duration_seconds = max(0.0, time.monotonic() - self.rep_started_ts)
                                 self.rep_data.append(
                                     {
                                         "start_angle": self.rep_start_angle,
@@ -606,7 +689,7 @@ class ExerciseAnalyzer:
                                 self.rep_left_up_zone = False
 
                         if self.rep_state == 1:
-                            if rep_angle < (down_min - phase_leave_margin):
+                            if departed_down_range:
                                 self.rep_left_down_zone = True
                             if self.rep_left_down_zone and down_min <= rep_angle <= down_max:
                                 self.up_range_miss_flash_frames = max(
@@ -615,7 +698,7 @@ class ExerciseAnalyzer:
                                 )
                                 self.rep_left_down_zone = False
                         elif self.rep_state == 2:
-                            if rep_angle > (up_max + phase_leave_margin):
+                            if departed_up_range:
                                 self.rep_left_up_zone = True
                             if self.rep_left_up_zone and up_min <= rep_angle <= up_max:
                                 self.down_range_miss_flash_frames = max(
@@ -625,15 +708,11 @@ class ExerciseAnalyzer:
                                 self.rep_left_up_zone = False
                 elif self.exercise == "deadlift":
                     if not form_ready:
-                        self.rep_state = 0
-                        self.rep_start_angle = None
-                        self.rep_started_ts = None
-                        self.rep_started_at_utc = None
-                        self.rep_active_arm = None
-                        self.rep_left_down_zone = False
-                        self.rep_left_up_zone = False
+                        self._reset_pending_rep()
                     else:
                         active_side = deadlift_form.get("active_side")
+                        if self.rep_active_arm is not None and active_side != self.rep_active_arm:
+                            self._reset_pending_rep()
                         top_position_ok = bool(deadlift_form.get("top_position_ok", False))
                         bottom_position_ok = bool(deadlift_form.get("bottom_position_ok", False))
 
@@ -653,7 +732,7 @@ class ExerciseAnalyzer:
                             if bottom_position_ok and same_side:
                                 self.rep_state = 2
                                 self.rep_start_angle = rep_angle
-                                self.rep_started_ts = time.time()
+                                self.rep_started_ts = time.monotonic()
                                 self.rep_started_at_utc = datetime.utcnow().isoformat()
                                 self.rep_active_arm = active_side
                                 self.rep_left_down_zone = False
@@ -679,7 +758,7 @@ class ExerciseAnalyzer:
                                 rep_ended_at_utc = datetime.utcnow().isoformat()
                                 duration_seconds = None
                                 if self.rep_started_ts is not None:
-                                    duration_seconds = max(0.0, time.time() - self.rep_started_ts)
+                                    duration_seconds = max(0.0, time.monotonic() - self.rep_started_ts)
                                 self.rep_data.append(
                                     {
                                         "start_angle": self.rep_start_angle,
@@ -712,7 +791,7 @@ class ExerciseAnalyzer:
                                 self.rep_left_up_zone = False
 
                         if self.rep_state == 1:
-                            if rep_angle < (down_min - phase_leave_margin):
+                            if departed_down_range:
                                 self.rep_left_down_zone = True
                             if self.rep_left_down_zone and down_min <= rep_angle <= down_max:
                                 self.up_range_miss_flash_frames = max(
@@ -721,7 +800,7 @@ class ExerciseAnalyzer:
                                 )
                                 self.rep_left_down_zone = False
                         elif self.rep_state == 2:
-                            if rep_angle > (up_max + phase_leave_margin):
+                            if departed_up_range:
                                 self.rep_left_up_zone = True
                             if self.rep_left_up_zone and up_min <= rep_angle <= up_max:
                                 self.down_range_miss_flash_frames = max(
@@ -731,14 +810,13 @@ class ExerciseAnalyzer:
                                 self.rep_left_up_zone = False
                 else:
                     if not form_ready:
+                        self._reset_pending_rep()
+                    elif self.rep_state == 0 and count_down_min <= rep_angle <= count_down_max:
                         self.rep_state = 1
-                        self.rep_start_angle = None
-                        self.rep_left_down_zone = False
-                        self.rep_left_up_zone = False
                     elif self.rep_state == 1 and count_up_min <= rep_angle <= count_up_max:
                         self.rep_state = 2
                         self.rep_start_angle = rep_angle
-                        self.rep_started_ts = time.time()
+                        self.rep_started_ts = time.monotonic()
                         self.rep_started_at_utc = datetime.utcnow().isoformat()
                         self.rep_left_down_zone = False
                         self.rep_left_up_zone = False
@@ -749,7 +827,7 @@ class ExerciseAnalyzer:
                         rep_ended_at_utc = datetime.utcnow().isoformat()
                         duration_seconds = None
                         if self.rep_started_ts is not None:
-                            duration_seconds = max(0.0, time.time() - self.rep_started_ts)
+                            duration_seconds = max(0.0, time.monotonic() - self.rep_started_ts)
                         self.rep_data.append(
                             {
                                 "start_angle": self.rep_start_angle,
@@ -766,7 +844,7 @@ class ExerciseAnalyzer:
                         self.rep_left_up_zone = False
 
                     if self.rep_state == 1:
-                        if rep_angle < (down_min - phase_leave_margin):
+                        if departed_down_range:
                             self.rep_left_down_zone = True
                         if self.rep_left_down_zone and down_min <= rep_angle <= down_max:
                             self.up_range_miss_flash_frames = max(
@@ -775,7 +853,7 @@ class ExerciseAnalyzer:
                             )
                             self.rep_left_down_zone = False
                     elif self.rep_state == 2:
-                        if rep_angle > (up_max + phase_leave_margin):
+                        if departed_up_range:
                             self.rep_left_up_zone = True
                         if self.rep_left_up_zone and up_min <= rep_angle <= up_max:
                             self.down_range_miss_flash_frames = max(

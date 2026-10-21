@@ -1,5 +1,5 @@
 import logging
-from math import atan2, degrees, hypot
+from math import atan2, degrees, hypot, isfinite
 
 import mediapipe as mp
 
@@ -11,17 +11,26 @@ logger = logging.getLogger(__name__)
 
 def _landmark_xy(landmarks, landmark):
     point = landmarks[landmark.value]
-    return [point.x, point.y]
+    coordinates = [float(point.x), float(point.y)]
+    if not all(isfinite(value) for value in coordinates):
+        raise ValueError("Landmark coordinates must be finite")
+    return coordinates
 
 
 def _landmark_xyz(landmarks, landmark):
     point = landmarks[landmark.value]
-    return [point.x, point.y, float(getattr(point, "z", 0.0))]
+    depth = float(getattr(point, "z", 0.0))
+    if not isfinite(depth):
+        raise ValueError("Landmark depth must be finite")
+    return [*_landmark_xy(landmarks, landmark), depth]
 
 
 def _landmark_visibility(landmarks, landmark):
     point = landmarks[landmark.value]
-    return float(getattr(point, "visibility", 1.0))
+    visibility = float(getattr(point, "visibility", 0.0))
+    if not isfinite(visibility) or not 0.0 <= visibility <= 1.0:
+        raise ValueError("Landmark visibility must be a finite confidence")
+    return visibility
 
 
 def _distance(p1, p2):
@@ -170,7 +179,9 @@ def evaluate_bicep_curl_form_gate(landmarks, cfg, active_curl_arm=None):
 
         shoulder_mid_y = (left_shoulder[1] + right_shoulder[1]) / 2
         hip_mid_y = (left_hip[1] + right_hip[1]) / 2
-        torso_height = max(1e-6, abs(shoulder_mid_y - hip_mid_y))
+        torso_height = abs(shoulder_mid_y - hip_mid_y)
+        if torso_height <= 1e-6:
+            raise ValueError("Torso landmarks do not define a measurable body")
 
         shoulder_width = abs(left_shoulder[0] - right_shoulder[0])
         hip_width = abs(left_hip[0] - right_hip[0])
@@ -310,6 +321,11 @@ def evaluate_bicep_curl_form_gate(landmarks, cfg, active_curl_arm=None):
             "active_wrist_shoulder_ratio": (
                 active_arm_metrics["wrist_shoulder_ratio"] if active_arm_metrics else None
             ),
+            "startup_wrist_shoulder_ratio": (
+                startup_active_arm_metrics["wrist_shoulder_ratio"]
+                if startup_active_arm_metrics
+                else None
+            ),
             "top_position_ok": top_position_ok,
             "shoulder_to_torso_ratio": shoulder_to_torso_ratio,
             "hip_to_torso_ratio": hip_to_torso_ratio,
@@ -333,6 +349,7 @@ def evaluate_bicep_curl_form_gate(landmarks, cfg, active_curl_arm=None):
             "startup_active_arm": None,
             "startup_rep_angle": None,
             "active_wrist_shoulder_ratio": None,
+            "startup_wrist_shoulder_ratio": None,
             "top_position_ok": False,
             "shoulder_to_torso_ratio": None,
             "hip_to_torso_ratio": None,
@@ -418,7 +435,9 @@ def evaluate_deadlift_form_gate(landmarks, cfg, active_body_side=None):
 
         shoulder_mid_y = (left_shoulder[1] + right_shoulder[1]) / 2.0
         hip_mid_y = (left_hip[1] + right_hip[1]) / 2.0
-        torso_height = max(1e-6, abs(shoulder_mid_y - hip_mid_y))
+        torso_height = abs(shoulder_mid_y - hip_mid_y)
+        if torso_height <= 1e-6:
+            raise ValueError("Torso landmarks do not define a measurable body")
 
         shoulder_width = abs(left_shoulder[0] - right_shoulder[0])
         hip_width = abs(left_hip[0] - right_hip[0])

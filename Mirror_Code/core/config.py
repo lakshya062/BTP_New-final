@@ -113,8 +113,10 @@ exercise_config = {
             'right_shoulder_elevation': [mp_pose.PoseLandmark.RIGHT_HIP, mp_pose.PoseLandmark.RIGHT_SHOULDER, mp_pose.PoseLandmark.RIGHT_ELBOW],
         },
         'rep_angle_keys': ['left_shoulder_elevation', 'right_shoulder_elevation'],
-        'down_range': (70, 90),    # Arms down
-        'up_range': (130, 150),    # Arms lifted to side
+        # HIP -> SHOULDER -> ELBOW is 0 degrees with the arm by the torso
+        # and 90 degrees with the upper arm horizontal.
+        'down_range': (0, 25),
+        'up_range': (70, 110),
         'reps_per_set': 15,
         'bend_detection': True
     }

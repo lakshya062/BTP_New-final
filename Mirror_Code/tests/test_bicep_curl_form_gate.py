@@ -15,6 +15,11 @@ def make_landmarks():
     points = [SimpleNamespace(x=0.5, y=0.5, z=0.0) for _ in range(len(mp_pose.PoseLandmark))]
     for idx in range(len(points)):
         setattr(points[idx], "visibility", 1.0)
+    for side, x in (("LEFT", 0.45), ("RIGHT", 0.55)):
+        points[getattr(mp_pose.PoseLandmark, f"{side}_SHOULDER").value].x = x
+        points[getattr(mp_pose.PoseLandmark, f"{side}_SHOULDER").value].y = 0.3
+        points[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].x = x
+        points[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].y = 0.65
     return points
 
 
@@ -192,7 +197,8 @@ class BicepCurlFormGateTest(unittest.TestCase):
                 feedback, _ = analyzer.analyze_exercise_form(landmarks, frame=None)
 
         self.assertEqual(analyzer.rep_count, 0)
-        self.assertEqual(analyzer.rep_state, 1)
+        self.assertEqual(analyzer.rep_state, 0)
+        self.assertIsNone(analyzer.rep_started_ts)
         self.assertTrue(any("Warning:" in text for text in feedback))
 
     def test_bicep_up_range_miss_overlay_flag_on_partial_rep(self):

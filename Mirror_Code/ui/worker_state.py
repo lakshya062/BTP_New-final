@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from math import isfinite
 
 
 def _clamp_seconds(value, minimum=0.0):
@@ -6,7 +7,7 @@ def _clamp_seconds(value, minimum=0.0):
         numeric = float(value)
     except (TypeError, ValueError):
         return float(minimum)
-    return max(float(minimum), numeric)
+    return max(float(minimum), numeric) if isfinite(numeric) else float(minimum)
 
 
 @dataclass
@@ -104,9 +105,7 @@ class FaceRecognitionState:
             self.unknown_threshold_seconds,
             self.unknown_elapsed_seconds + dt,
         )
-        self.known_elapsed_seconds = max(0.0, self.known_elapsed_seconds - dt)
-        if self.known_elapsed_seconds <= 0.0:
-            self.last_recognized_user = None
+        self.clear_known_progress()
         if (
             self.unknown_elapsed_seconds >= self.unknown_threshold_seconds
             and not self.unknown_prompted
@@ -124,22 +123,15 @@ class FaceRecognitionState:
         if not recognized_user:
             return False
 
-        if self.last_recognized_user is None:
+        if self.last_recognized_user != recognized_user:
             self.last_recognized_user = recognized_user
-            self.known_elapsed_seconds = max(
-                self.min_observation_seconds,
-                self.known_elapsed_seconds,
-            )
-        elif recognized_user == self.last_recognized_user:
+            # Evidence belongs to one identity and must never transfer to a
+            # different person when the primary face changes.
+            self.known_elapsed_seconds = min(self.known_threshold_seconds, dt)
+        else:
             self.known_elapsed_seconds = min(
                 self.known_threshold_seconds,
                 self.known_elapsed_seconds + dt,
-            )
-        else:
-            self.last_recognized_user = recognized_user
-            self.known_elapsed_seconds = max(
-                self.min_observation_seconds,
-                self.known_elapsed_seconds - self.switch_penalty_seconds,
             )
 
         return self.known_elapsed_seconds >= self.known_threshold_seconds
@@ -147,9 +139,7 @@ class FaceRecognitionState:
     def observe_no_face(self, elapsed_seconds):
         dt = _clamp_seconds(elapsed_seconds)
         self.unknown_elapsed_seconds = max(0.0, self.unknown_elapsed_seconds - dt)
-        self.known_elapsed_seconds = max(0.0, self.known_elapsed_seconds - dt)
-        if self.known_elapsed_seconds <= 0.0:
-            self.last_recognized_user = None
+        self.clear_known_progress()
         if self.unknown_elapsed_seconds <= 0.0:
             self.unknown_prompted = False
 
@@ -180,7 +170,7 @@ class RegistrationCaptureState:
         self.user_name = str(user_name or "").strip() or None
 
     def add_valid_encoding(self, encoding, elapsed_seconds):
-        if not self.active:
+        if not self.active or encoding is None:
             return
         dt = _clamp_seconds(elapsed_seconds)
         self.valid_capture_seconds = min(

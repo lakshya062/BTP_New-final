@@ -5,6 +5,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv-*/
 venv/
 env/
 gymstartup/
@@ -12,6 +13,9 @@ gymstartup/
 # Build / distribution folders
 dist/
 build/
+
+# Generated simulation reports and images
+artifacts/
 
 # Ignore Testing folder inside Mirror_Code
 Mirror_Code/Testing/

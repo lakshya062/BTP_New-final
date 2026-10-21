@@ -19,14 +19,14 @@ fi
 
 docker load -i "${IMAGE_BUNDLE}"
 
-docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d postgres backend
+docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" up -d postgres
 
 if [[ "${START_MIRROR}" -eq 1 ]]; then
   export DISPLAY="${DISPLAY:-:0}"
   xhost +local:docker >/dev/null 2>&1 || true
   docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" --profile mirror up -d mirror
-  echo "Backend, database, and mirror containers are starting."
+  echo "Database and mirror containers are starting."
 else
-  echo "Backend and database containers are starting."
+  echo "Database container is starting."
   echo "Run ./run_centralized_linux.sh --start-mirror when X11/camera passthrough is available."
 fi
